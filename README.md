@@ -80,4 +80,9 @@ GitHub Actions でも push/PR 時にテストが自動実行されます。
 
 ## ライセンス
 
-[いいかんじ™ライセンス (IKL)](LICENSE) — MIT 互換
+[MIT License](LICENSE) — Copyright (c) 2026- nananek
+
+このクライアントライブラリは MIT License で配布されており、本サーバー向け以外
+の用途にも自由に利用できます。サーバー本体 (`iikanji-kakeibo`) は別途
+Sustainable Use License v1.0 で配布されており、商用 SaaS としての提供は
+制限されますが、本クライアントには制限はかかりません。
