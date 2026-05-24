@@ -48,24 +48,32 @@ class KakeiboClient:
         api_key: str,
         *,
         openai_api_key: str | None = None,
+        anthropic_api_key: str | None = None,
+        google_api_key: str | None = None,
         timeout: float = 30.0,
         http_client: httpx.Client | None = None,
         llm_http_client: httpx.Client | None = None,
     ) -> None:
-        """E2 PR-D-a: openai_api_key を保持してクライアント完結 AI 解析を行う。
+        """E2 PR-D-a/b: 各 provider の API キーを保持してクライアント完結 AI 解析。
 
         Args:
             base_url: いいかんじ家計簿サーバの URL
             api_key: Bearer API キー (サーバ認証用)
-            openai_api_key: OpenAI API キー (AI 解析時に必須)。サーバ E2EE
-                blob はブラウザ SharedWorker でしか復号できないため、Python
-                クライアントはオーナーが直接 OpenAI キーを保持する設計。
+            openai_api_key / anthropic_api_key / google_api_key:
+                対応する provider の API キー。analyze() で実際に呼ばれる
+                provider のキーが必須。サーバ E2EE blob はブラウザ
+                SharedWorker でしか復号できないため、Python クライアントは
+                オーナーが直接 LLM API キーを保持する設計。
             timeout / http_client: サーバ通信用
-            llm_http_client: LLM (OpenAI) 通信用 (テスト DI、省略時は httpx 標準)
+            llm_http_client: LLM 通信用 (テスト DI、省略時は httpx 標準)
         """
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
-        self._openai_api_key = openai_api_key
+        self._llm_api_keys = {
+            "openai": openai_api_key,
+            "anthropic": anthropic_api_key,
+            "google": google_api_key,
+        }
         self._llm_http_client = llm_http_client
         if http_client is not None:
             self._client = http_client
@@ -215,18 +223,21 @@ class KakeiboClient:
         *,
         comment: str = "",
         mime_type: str | None = None,
+        provider: str = "openai",
         model: str | None = None,
     ) -> AnalyzeResponse:
         """画像を AI 解析して下書きを作成する。必要なスコープ: ``ai:analyze``
 
-        E2 PR-D-a: クライアント完結 E2EE フローに移行。OpenAI API キーは
-        KakeiboClient(__init__, openai_api_key=...) で渡す。サーバには画像と
-        メタデータのみ送信され、OpenAI 呼出はこのプロセスから直接行われる。
+        E2 PR-D-a/b: クライアント完結 E2EE フロー。provider に応じた LLM API
+        キーは KakeiboClient(__init__, openai_api_key= / anthropic_api_key= /
+        google_api_key=...) で渡す。サーバには画像とメタデータのみ送信され、
+        LLM 呼出はこのプロセスから直接行われる。
 
         Args:
             image: 画像ファイルパス (str/Path) またはバイト列
             comment: メモ (省略可、最大500文字)
             mime_type: バイト列渡し時の MIME タイプ (デフォルト: image/jpeg)
+            provider: "openai" / "anthropic" / "google" (デフォルト openai)
             model: 使用モデル名 (省略時はサーバの default_model_by_provider)
 
         Returns:
@@ -234,10 +245,16 @@ class KakeiboClient:
         """
         from . import llm
 
-        if self._openai_api_key is None:
+        llm_api_key = self._llm_api_keys.get(provider)
+        if llm_api_key is None:
             raise ValueError(
-                "openai_api_key が未設定です。KakeiboClient(__init__, "
-                "openai_api_key=...) で OpenAI API キーを渡してください。"
+                f"{provider}_api_key が未設定です。KakeiboClient(__init__, "
+                f"{provider}_api_key=...) で API キーを渡してください。"
+            )
+        if provider not in llm.IMAGE_HANDLERS:
+            raise ValueError(
+                f"unsupported provider: {provider} (supported: "
+                f"{', '.join(sorted(llm.IMAGE_HANDLERS))})"
             )
 
         if isinstance(image, (str, Path)):
@@ -268,7 +285,12 @@ class KakeiboClient:
         # 3. Round 1 (画像 → DocumentAnalysis)
         actual_model = model or prompt_context.get(
             "default_model_by_provider", {}
-        ).get("openai", "gpt-4o")
+        ).get(provider)
+        if not actual_model:
+            raise ValueError(
+                f"provider {provider} のデフォルトモデルが取得できません。"
+                "model 引数を明示してください。"
+            )
         compliance_check_enabled = bool(
             prompt_context.get("compliance_check_enabled"),
         )
@@ -280,8 +302,9 @@ class KakeiboClient:
             comment=comment,
         )
         max_tokens_r1 = 1500 if compliance_check_enabled else 1000
-        r1_raw = llm.call_openai_image(
-            api_key=self._openai_api_key,
+        r1_raw = llm.call_image_llm(
+            provider=provider,
+            api_key=llm_api_key,
             model=actual_model,
             image_bytes=image_bytes,
             mime_type=actual_mime,
@@ -311,8 +334,9 @@ class KakeiboClient:
             needs_ledger=analysis.needs_ledger,
             ledger_text=ledger_text,
         )
-        r2_raw = llm.call_openai_image(
-            api_key=self._openai_api_key,
+        r2_raw = llm.call_image_llm(
+            provider=provider,
+            api_key=llm_api_key,
             model=actual_model,
             image_bytes=image_bytes,
             mime_type=actual_mime,
@@ -335,7 +359,7 @@ class KakeiboClient:
             f"/api/v1/ai/drafts/{draft_id}/suggestions",
             json={
                 "suggestions": suggestions,
-                "provider": "openai",
+                "provider": provider,
                 "model": actual_model,
             },
         )

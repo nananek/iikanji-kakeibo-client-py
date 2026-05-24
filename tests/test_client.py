@@ -433,6 +433,33 @@ class TestAnalyze:
             with pytest.raises(ValueError, match="openai_api_key"):
                 client.analyze(b"\xff\xd8")
 
+    def test_requires_anthropic_api_key(self) -> None:
+        with KakeiboClient(
+            "https://test.example.com", "ik_testkey",
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda r: httpx.Response(200, json={}),
+                ),
+                base_url="https://test.example.com",
+            ),
+        ) as client:
+            with pytest.raises(ValueError, match="anthropic_api_key"):
+                client.analyze(b"\xff\xd8", provider="anthropic")
+
+    def test_unsupported_provider_raises(self) -> None:
+        with KakeiboClient(
+            "https://test.example.com", "ik_testkey",
+            openai_api_key="sk-x",  # 何か一つはキーを設定
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda r: httpx.Response(200, json={}),
+                ),
+                base_url="https://test.example.com",
+            ),
+        ) as client:
+            with pytest.raises(ValueError, match="evil_api_key"):
+                client.analyze(b"\xff\xd8", provider="evil")
+
     def test_success_full_flow(self) -> None:
         """2-step フロー: uploads → prompt-context → Round 1 → Round 2 → save."""
         server_calls: list[httpx.Request] = []
@@ -593,6 +620,117 @@ class TestAnalyze:
         ) as client:
             with pytest.raises(KakeiboAPIError):
                 client.analyze(b"\xff\xd8")
+
+    def test_anthropic_provider(self) -> None:
+        """provider=anthropic で Anthropic API を呼ぶ。"""
+        server_calls: list[httpx.Request] = []
+
+        def server_handler(request: httpx.Request) -> httpx.Response:
+            server_calls.append(request)
+            path = request.url.path
+            if path == "/api/v1/ai/uploads":
+                return httpx.Response(201, json={"draft_id": 1})
+            if path == "/api/v1/ai/prompt-context":
+                return httpx.Response(200, json=self._PROMPT_CTX)
+            if path.endswith("/suggestions"):
+                body = json.loads(request.content)
+                assert body["provider"] == "anthropic"
+                assert body["model"] == "claude-sonnet-4-20250514"
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(404)
+
+        llm_calls: list[httpx.Request] = []
+
+        def anthropic_handler(request: httpx.Request) -> httpx.Response:
+            llm_calls.append(request)
+            return httpx.Response(200, json={
+                "content": [{"text": json.dumps({
+                    "needs_ledger": False,
+                    "suggestions": [{
+                        "title": "x", "lines": [
+                            {"account_code": "5010", "debit_amount": 100,
+                             "credit_amount": 0},
+                            {"account_code": "1010", "debit_amount": 0,
+                             "credit_amount": 100},
+                        ],
+                    }],
+                })}],
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            })
+
+        with KakeiboClient(
+            "https://test.example.com", "ik_testkey",
+            anthropic_api_key="sk-ant-x",
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(server_handler),
+                base_url="https://test.example.com",
+                headers={"Authorization": "Bearer ik_testkey"},
+            ),
+            llm_http_client=httpx.Client(
+                transport=httpx.MockTransport(anthropic_handler),
+            ),
+        ) as client:
+            client.analyze(b"\xff\xd8", provider="anthropic")
+
+        # x-api-key + anthropic-version ヘッダで呼ばれている
+        assert llm_calls[0].headers["x-api-key"] == "sk-ant-x"
+        assert llm_calls[0].headers["anthropic-version"] == "2023-06-01"
+        assert "api.anthropic.com" in str(llm_calls[0].url)
+
+    def test_google_provider(self) -> None:
+        """provider=google で Gemini API を呼ぶ (URL クエリで認証)。"""
+
+        def server_handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/api/v1/ai/uploads":
+                return httpx.Response(201, json={"draft_id": 1})
+            if path == "/api/v1/ai/prompt-context":
+                return httpx.Response(200, json=self._PROMPT_CTX)
+            if path.endswith("/suggestions"):
+                body = json.loads(request.content)
+                assert body["provider"] == "google"
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(404)
+
+        llm_calls: list[httpx.Request] = []
+
+        def google_handler(request: httpx.Request) -> httpx.Response:
+            llm_calls.append(request)
+            return httpx.Response(200, json={
+                "candidates": [{"content": {"parts": [
+                    {"text": json.dumps({
+                        "needs_ledger": False,
+                        "suggestions": [{
+                            "title": "x", "lines": [
+                                {"account_code": "5010", "debit_amount": 100,
+                                 "credit_amount": 0},
+                                {"account_code": "1010", "debit_amount": 0,
+                                 "credit_amount": 100},
+                            ],
+                        }],
+                    })},
+                ]}}],
+                "usageMetadata": {"promptTokenCount": 10,
+                                   "candidatesTokenCount": 5},
+            })
+
+        with KakeiboClient(
+            "https://test.example.com", "ik_testkey",
+            google_api_key="goog-key",
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(server_handler),
+                base_url="https://test.example.com",
+                headers={"Authorization": "Bearer ik_testkey"},
+            ),
+            llm_http_client=httpx.Client(
+                transport=httpx.MockTransport(google_handler),
+            ),
+        ) as client:
+            client.analyze(b"\xff\xd8", provider="google")
+
+        # URL クエリに ?key= が含まれる
+        assert "key=goog-key" in str(llm_calls[0].url)
+        assert "generativelanguage.googleapis.com" in str(llm_calls[0].url)
 
     def test_custom_model_used(self) -> None:
         """model 引数指定でデフォルトモデルを上書き。"""
