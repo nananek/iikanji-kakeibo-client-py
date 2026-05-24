@@ -47,11 +47,26 @@ class KakeiboClient:
         base_url: str,
         api_key: str,
         *,
+        openai_api_key: str | None = None,
         timeout: float = 30.0,
         http_client: httpx.Client | None = None,
+        llm_http_client: httpx.Client | None = None,
     ) -> None:
+        """E2 PR-D-a: openai_api_key を保持してクライアント完結 AI 解析を行う。
+
+        Args:
+            base_url: いいかんじ家計簿サーバの URL
+            api_key: Bearer API キー (サーバ認証用)
+            openai_api_key: OpenAI API キー (AI 解析時に必須)。サーバ E2EE
+                blob はブラウザ SharedWorker でしか復号できないため、Python
+                クライアントはオーナーが直接 OpenAI キーを保持する設計。
+            timeout / http_client: サーバ通信用
+            llm_http_client: LLM (OpenAI) 通信用 (テスト DI、省略時は httpx 標準)
+        """
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
+        self._openai_api_key = openai_api_key
+        self._llm_http_client = llm_http_client
         if http_client is not None:
             self._client = http_client
             self._owns_client = False
@@ -199,20 +214,32 @@ class KakeiboClient:
         image: str | Path | bytes,
         *,
         comment: str = "",
-        notify: bool = False,
         mime_type: str | None = None,
+        model: str | None = None,
     ) -> AnalyzeResponse:
         """画像を AI 解析して下書きを作成する。必要なスコープ: ``ai:analyze``
+
+        E2 PR-D-a: クライアント完結 E2EE フローに移行。OpenAI API キーは
+        KakeiboClient(__init__, openai_api_key=...) で渡す。サーバには画像と
+        メタデータのみ送信され、OpenAI 呼出はこのプロセスから直接行われる。
 
         Args:
             image: 画像ファイルパス (str/Path) またはバイト列
             comment: メモ (省略可、最大500文字)
-            notify: True で Webhook 通知を送信
             mime_type: バイト列渡し時の MIME タイプ (デフォルト: image/jpeg)
+            model: 使用モデル名 (省略時はサーバの default_model_by_provider)
 
         Returns:
             AnalyzeResponse: 作成された下書き ID と候補リスト
         """
+        from . import llm
+
+        if self._openai_api_key is None:
+            raise ValueError(
+                "openai_api_key が未設定です。KakeiboClient(__init__, "
+                "openai_api_key=...) で OpenAI API キーを渡してください。"
+            )
+
         if isinstance(image, (str, Path)):
             path = Path(image)
             image_bytes = path.read_bytes()
@@ -220,22 +247,105 @@ class KakeiboClient:
         else:
             image_bytes = image
             filename = "image.jpg"
+        actual_mime = mime_type or "image/jpeg"
 
-        files = {"image": (filename, image_bytes, mime_type or "image/jpeg")}
+        # 1. POST /api/v1/ai/uploads — サーバが画像を保存し draft_id を返す
+        files = {"image": (filename, image_bytes, actual_mime)}
         data: dict[str, str] = {}
         if comment:
             data["comment"] = comment[:500]
-        if notify:
-            data["notify"] = "1"
+        resp = self._client.post("/api/v1/ai/uploads", files=files, data=data)
+        if resp.status_code != 201:
+            self._raise_for_error(resp)
+        draft_id = resp.json()["draft_id"]
 
-        resp = self._client.post("/api/v1/ai/analyze", files=files, data=data)
-        if resp.status_code == 201:
-            body = resp.json()
-            return AnalyzeResponse(
-                draft_id=body["draft_id"],
-                suggestions=body["suggestions"],
+        # 2. GET /api/v1/ai/prompt-context — Round 1+2 プロンプト材料取得
+        ctx_resp = self._client.get("/api/v1/ai/prompt-context")
+        if ctx_resp.status_code != 200:
+            self._raise_for_error(ctx_resp)
+        prompt_context = ctx_resp.json()
+
+        # 3. Round 1 (画像 → DocumentAnalysis)
+        actual_model = model or prompt_context.get(
+            "default_model_by_provider", {}
+        ).get("openai", "gpt-4o")
+        compliance_check_enabled = bool(
+            prompt_context.get("compliance_check_enabled"),
+        )
+        round1_prompt = llm.build_round1_prompt(
+            round1_prompt=prompt_context.get("round1_prompt", ""),
+            compliance_check_enabled=compliance_check_enabled,
+            compliance_prompt=prompt_context.get("compliance_prompt", ""),
+            custom_prompt=prompt_context.get("custom_prompt", ""),
+            comment=comment,
+        )
+        max_tokens_r1 = 1500 if compliance_check_enabled else 1000
+        r1_raw = llm.call_openai_image(
+            api_key=self._openai_api_key,
+            model=actual_model,
+            image_bytes=image_bytes,
+            mime_type=actual_mime,
+            prompt=round1_prompt,
+            max_tokens=max_tokens_r1,
+            http_client=self._llm_http_client,
+        )
+        analysis = llm.parse_document_analysis(r1_raw)
+        compliance_result = (
+            llm.parse_compliance_result(r1_raw.get("compliance"))
+            if compliance_check_enabled else None
+        )
+
+        # 4. needs_ledger なら ledger 取得
+        ledger_text = ""
+        if analysis.needs_ledger and analysis.requested_accounts:
+            ledger_resp = self._client.post(
+                "/api/v1/ai/ledger-context",
+                json={"account_names": analysis.requested_accounts},
             )
-        self._raise_for_error(resp)
+            if ledger_resp.status_code == 200:
+                ledger_text = ledger_resp.json().get("ledger_text", "")
+
+        # 5. Round 2 (画像 + 元帳 → suggestions)
+        round2_prompt = llm.build_round2_prompt(
+            prompt_context=prompt_context,
+            needs_ledger=analysis.needs_ledger,
+            ledger_text=ledger_text,
+        )
+        r2_raw = llm.call_openai_image(
+            api_key=self._openai_api_key,
+            model=actual_model,
+            image_bytes=image_bytes,
+            mime_type=actual_mime,
+            prompt=round2_prompt,
+            max_tokens=2000,
+            http_client=self._llm_http_client,
+        )
+        valid_codes = {
+            line.split()[0]
+            for line in prompt_context.get("account_list_text", "").split("\n")
+            if line.strip() and line.strip()[0].isdigit()
+        }
+        suggestions = llm.validate_suggestions(r2_raw, valid_codes)
+        if compliance_result is not None:
+            for s in suggestions:
+                s["compliance"] = compliance_result
+
+        # 6. PATCH /api/v1/ai/drafts/<id>/suggestions — 結果保存 + AIUsageLog
+        save_resp = self._client.patch(
+            f"/api/v1/ai/drafts/{draft_id}/suggestions",
+            json={
+                "suggestions": suggestions,
+                "provider": "openai",
+                "model": actual_model,
+            },
+        )
+        if save_resp.status_code != 200:
+            self._raise_for_error(save_resp)
+
+        return AnalyzeResponse(
+            draft_id=draft_id,
+            suggestions=suggestions,
+        )
 
     def list_drafts(
         self,

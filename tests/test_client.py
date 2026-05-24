@@ -395,59 +395,256 @@ SAMPLE_DRAFT = {
 
 
 class TestAnalyze:
-    def test_success(self) -> None:
-        body = {"ok": True, "draft_id": 10, "suggestions": SAMPLE_SUGGESTIONS}
+    """E2 PR-D-a: クライアント完結 2-step + OpenAI 呼出フロー。"""
 
-        captured: list[httpx.Request] = []
+    _PROMPT_CTX = {
+        "ok": True,
+        "round1_prompt": "DOC_PROMPT",
+        "compliance_prompt": "",
+        "compliance_check_enabled": False,
+        "round2_prompt_template_no_ledger": "R2NL __ACCOUNT_LIST_TEXT__",
+        "round2_prompt_template_with_ledger":
+            "R2WL __ACCOUNT_LIST_TEXT__ L __LEDGER_TEXT__",
+        "account_list_text": "5010 食費\n1010 現金",
+        "custom_prompt": "",
+        "default_model_by_provider": {
+            "openai": "gpt-4o",
+            "anthropic": "claude-sonnet-4-20250514",
+            "google": "gemini-2.0-flash",
+        },
+    }
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured.append(request)
-            return httpx.Response(201, json=body)
+    def _make_openai_response(self, content: dict) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": json.dumps(content)}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+        })
 
-        http_client = httpx.Client(
-            transport=httpx.MockTransport(handler),
+    def test_requires_openai_api_key(self) -> None:
+        with KakeiboClient(
+            "https://test.example.com", "ik_testkey",
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda r: httpx.Response(200, json={}),
+                ),
+                base_url="https://test.example.com",
+            ),
+        ) as client:
+            with pytest.raises(ValueError, match="openai_api_key"):
+                client.analyze(b"\xff\xd8")
+
+    def test_success_full_flow(self) -> None:
+        """2-step フロー: uploads → prompt-context → Round 1 → Round 2 → save."""
+        server_calls: list[httpx.Request] = []
+
+        def server_handler(request: httpx.Request) -> httpx.Response:
+            server_calls.append(request)
+            path = request.url.path
+            if path == "/api/v1/ai/uploads":
+                return httpx.Response(201, json={
+                    "ok": True, "draft_id": 42, "status": "pending",
+                })
+            if path == "/api/v1/ai/prompt-context":
+                return httpx.Response(200, json=self._PROMPT_CTX)
+            if path == "/api/v1/ai/drafts/42/suggestions":
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(404)
+
+        # Round 1 + Round 2 の OpenAI 応答
+        openai_responses = [
+            self._make_openai_response({
+                "date": "2026-02-15", "description": "セブン",
+                "amount": 500, "document_type": "receipt",
+                "needs_ledger": False, "requested_accounts": [],
+            }),
+            self._make_openai_response({
+                "suggestions": [{
+                    "title": "食費",
+                    "description": "コンビニで食料品購入",
+                    "date": "2026-02-15",
+                    "entry_description": "セブン",
+                    "lines": [
+                        {"account_code": "5010", "account_name": "食費",
+                         "debit_amount": 500, "credit_amount": 0},
+                        {"account_code": "1010", "account_name": "現金",
+                         "debit_amount": 0, "credit_amount": 500},
+                    ],
+                }],
+            }),
+        ]
+
+        def openai_handler(request: httpx.Request) -> httpx.Response:
+            return openai_responses.pop(0)
+
+        server_client = httpx.Client(
+            transport=httpx.MockTransport(server_handler),
             base_url="https://test.example.com",
             headers={"Authorization": "Bearer ik_testkey"},
         )
+        openai_client = httpx.Client(
+            transport=httpx.MockTransport(openai_handler),
+        )
 
-        with KakeiboClient("https://test.example.com", "ik_testkey", http_client=http_client) as client:
+        with KakeiboClient(
+            "https://test.example.com", "ik_testkey",
+            openai_api_key="sk-test",
+            http_client=server_client,
+            llm_http_client=openai_client,
+        ) as client:
             result = client.analyze(b"\xff\xd8\xff\xe0", comment="テストメモ")
 
         assert isinstance(result, AnalyzeResponse)
-        assert result.draft_id == 10
+        assert result.draft_id == 42
         assert len(result.suggestions) == 1
         assert result.suggestions[0]["title"] == "食費"
+        assert result.suggestions[0]["lines"][0]["account_code"] == "5010"
 
-        # multipart で送信されていることを確認
-        req = captured[0]
-        assert "/api/v1/ai/analyze" in str(req.url)
+        # サーバ呼出順: uploads → prompt-context → PATCH suggestions
+        server_paths = [r.url.path for r in server_calls]
+        assert server_paths == [
+            "/api/v1/ai/uploads",
+            "/api/v1/ai/prompt-context",
+            "/api/v1/ai/drafts/42/suggestions",
+        ]
+        # PATCH ボディに provider/model 含む
+        patch_body = json.loads(server_calls[2].content)
+        assert patch_body["provider"] == "openai"
+        assert patch_body["model"] == "gpt-4o"
+        assert len(patch_body["suggestions"]) == 1
 
-    def test_with_notify(self) -> None:
-        captured: list[httpx.Request] = []
+    def test_needs_ledger_fetches_ledger_context(self) -> None:
+        """Round 1 で needs_ledger=true なら ledger-context POST を挟む。"""
+        server_calls: list[httpx.Request] = []
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured.append(request)
-            return httpx.Response(201, json={"ok": True, "draft_id": 1, "suggestions": []})
+        def server_handler(request: httpx.Request) -> httpx.Response:
+            server_calls.append(request)
+            path = request.url.path
+            if path == "/api/v1/ai/uploads":
+                return httpx.Response(201, json={"ok": True, "draft_id": 7})
+            if path == "/api/v1/ai/prompt-context":
+                return httpx.Response(200, json=self._PROMPT_CTX)
+            if path == "/api/v1/ai/ledger-context":
+                return httpx.Response(200, json={"ledger_text": "LEDGER_DATA"})
+            if path.endswith("/suggestions"):
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(404)
 
-        http_client = httpx.Client(
-            transport=httpx.MockTransport(handler),
-            base_url="https://test.example.com",
-            headers={"Authorization": "Bearer ik_testkey"},
-        )
+        openai_responses = [
+            self._make_openai_response({
+                "date": "2026-02-15", "description": "給与",
+                "amount": 250000, "document_type": "payslip",
+                "needs_ledger": True, "requested_accounts": ["給料手当"],
+            }),
+            self._make_openai_response({
+                "suggestions": [{
+                    "title": "給与", "description": "",
+                    "date": "2026-02-15", "entry_description": "給与",
+                    "lines": [
+                        {"account_code": "5010", "debit_amount": 250000,
+                         "credit_amount": 0},
+                        {"account_code": "1010", "debit_amount": 0,
+                         "credit_amount": 250000},
+                    ],
+                }],
+            }),
+        ]
+        round2_seen_prompt: list[str] = []
 
-        with KakeiboClient("https://test.example.com", "ik_testkey", http_client=http_client) as client:
-            client.analyze(b"\xff\xd8", notify=True)
+        def openai_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            prompt = body["messages"][0]["content"][0]["text"]
+            round2_seen_prompt.append(prompt)
+            return openai_responses.pop(0)
 
-        content = captured[0].content.decode("utf-8", errors="replace")
-        assert "notify" in content
-
-    def test_api_error(self) -> None:
-        client = _make_client(400, {"error": "AI API設定が未登録です。"})
-
-        with client, pytest.raises(KakeiboAPIError) as exc_info:
+        with KakeiboClient(
+            "https://test.example.com", "ik_testkey",
+            openai_api_key="sk-x",
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(server_handler),
+                base_url="https://test.example.com",
+                headers={"Authorization": "Bearer ik_testkey"},
+            ),
+            llm_http_client=httpx.Client(
+                transport=httpx.MockTransport(openai_handler),
+            ),
+        ) as client:
             client.analyze(b"\xff\xd8")
 
-        assert exc_info.value.status_code == 400
+        # ledger-context が呼ばれた
+        assert any(
+            r.url.path == "/api/v1/ai/ledger-context" for r in server_calls
+        )
+        # Round 2 プロンプトに LEDGER_DATA が含まれる
+        assert "LEDGER_DATA" in round2_seen_prompt[1]
+
+    def test_uploads_error_propagates(self) -> None:
+        """uploads が失敗したら早期 raise。"""
+        def server_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(413, json={"error": "too large"})
+
+        with KakeiboClient(
+            "https://test.example.com", "ik_testkey",
+            openai_api_key="sk-x",
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(server_handler),
+                base_url="https://test.example.com",
+                headers={"Authorization": "Bearer ik_testkey"},
+            ),
+        ) as client:
+            with pytest.raises(KakeiboAPIError):
+                client.analyze(b"\xff\xd8")
+
+    def test_custom_model_used(self) -> None:
+        """model 引数指定でデフォルトモデルを上書き。"""
+
+        def server_handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/api/v1/ai/uploads":
+                return httpx.Response(201, json={"draft_id": 1})
+            if path == "/api/v1/ai/prompt-context":
+                return httpx.Response(200, json=self._PROMPT_CTX)
+            if path.endswith("/suggestions"):
+                # PATCH body の model を検証
+                body = json.loads(request.content)
+                assert body["model"] == "gpt-4-vision-preview"
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(404)
+
+        seen_models: list[str] = []
+
+        def openai_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            seen_models.append(body["model"])
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": json.dumps({
+                    "needs_ledger": False, "requested_accounts": [],
+                    "suggestions": [{
+                        "title": "x", "lines": [
+                            {"account_code": "5010", "debit_amount": 100,
+                             "credit_amount": 0},
+                            {"account_code": "1010", "debit_amount": 0,
+                             "credit_amount": 100},
+                        ],
+                    }],
+                })}}],
+            })
+
+        with KakeiboClient(
+            "https://test.example.com", "ik_testkey",
+            openai_api_key="sk-x",
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(server_handler),
+                base_url="https://test.example.com",
+                headers={"Authorization": "Bearer ik_testkey"},
+            ),
+            llm_http_client=httpx.Client(
+                transport=httpx.MockTransport(openai_handler),
+            ),
+        ) as client:
+            client.analyze(b"\xff\xd8", model="gpt-4-vision-preview")
+
+        # Round 1 と Round 2 両方で custom model が使われている
+        assert seen_models == ["gpt-4-vision-preview", "gpt-4-vision-preview"]
 
 
 class TestListDrafts:
