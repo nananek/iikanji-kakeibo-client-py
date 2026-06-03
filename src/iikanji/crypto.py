@@ -253,6 +253,117 @@ def sniff_image_mime(data: bytes) -> str:
     return "application/octet-stream"
 
 
+# --- .ikbackup 暗号化アーカイブ (backup_archive.js, v5 BU-3) ---
+#
+# パスフレーズ Argon2id + AES-256-GCM。MK と独立した「災害時用の鍵」。
+# バイナリレイアウト (すべて big-endian):
+#   offset size field
+#   0      8    magic    = "IKBKP\0\0\0"
+#   8      1    version  = 0x01
+#   9      3    reserved = 0x000000
+#   12     4    argon2_memory_kib  (uint32 BE)
+#   16     4    argon2_iterations  (uint32 BE)
+#   20     4    argon2_parallelism (uint32 BE)
+#   24     16   salt
+#   40     12   iv
+#   52     4    ciphertext_len_low32  (uint32 BE)
+#   56     4    ciphertext_len_high32 (uint32 BE, 現状常に 0)
+#   60     ...  ciphertext + 16B GCM tag
+# AAD = 先頭 40 bytes (magic+version+reserved+argon2_*+salt)。
+
+_IKBACKUP_MAGIC = b"IKBKP\x00\x00\x00"
+_IKBACKUP_VERSION = 1
+_IKBACKUP_HEADER_LEN = 60
+IKBACKUP_PASSPHRASE_MIN_LEN = 8
+
+# Argon2id デフォルト (argon2.js ARGON2ID_DEFAULTS)。memory は KiB。
+BACKUP_ARGON2_DEFAULTS = {"memory": 65536, "iterations": 3, "parallelism": 1}
+
+
+def _assert_backup_passphrase(passphrase: str) -> None:
+    if not isinstance(passphrase, str):
+        raise TypeError("passphrase must be a string")
+    if len(passphrase) < IKBACKUP_PASSPHRASE_MIN_LEN:
+        raise ValueError(
+            f"passphrase must be at least {IKBACKUP_PASSPHRASE_MIN_LEN} characters"
+        )
+
+
+def _ikbackup_header(salt: bytes, iv: bytes, ct_len: int, params: dict) -> bytes:
+    """60B ヘッダを組み立てる。先頭 40B が AAD になる。"""
+    return (
+        _IKBACKUP_MAGIC
+        + bytes([_IKBACKUP_VERSION])
+        + b"\x00\x00\x00"  # reserved
+        + struct.pack(
+            ">III",
+            int(params["memory"]),
+            int(params["iterations"]),
+            int(params["parallelism"]),
+        )
+        + bytes(salt)
+        + bytes(iv)
+        + struct.pack(">I", ct_len & 0xFFFFFFFF)
+        + struct.pack(">I", ct_len >> 32)
+    )
+
+
+def encrypt_backup_archive(
+    plaintext: bytes, passphrase: str, *, params: dict | None = None
+) -> bytes:
+    """plaintext をパスフレーズで暗号化し ``.ikbackup`` バイナリを返す。
+
+    Web ``backup_archive.js: encryptBackupArchive`` と byte 互換。鍵導出は MK と
+    独立した Argon2id (デフォルト memory=64MiB/iterations=3/parallelism=1)。
+
+    Args:
+        plaintext: 暗号化対象 (例: ``json.dumps(backup).encode("utf-8")``)
+        passphrase: 8 文字以上のパスフレーズ
+        params: Argon2id パラメータ ``{"memory","iterations","parallelism"}`` を
+            上書き (省略時 :data:`BACKUP_ARGON2_DEFAULTS`)。
+    """
+    if not isinstance(plaintext, (bytes, bytearray)):
+        raise TypeError("plaintext must be bytes")
+    _assert_backup_passphrase(passphrase)
+    p = {**BACKUP_ARGON2_DEFAULTS, **(params or {})}
+    salt = os.urandom(16)
+    iv = os.urandom(12)
+    # AAD は ciphertext 長を含まないヘッダ先頭 40B。ct 長確定前に組める。
+    header = _ikbackup_header(salt, iv, 0, p)
+    aad = header[:40]
+    derived = derive_key(passphrase, salt, p)
+    ct = AESGCM(derived).encrypt(iv, bytes(plaintext), aad)
+    return _ikbackup_header(salt, iv, len(ct), p) + ct
+
+
+def decrypt_backup_archive(archive: bytes, passphrase: str) -> bytes:
+    """``.ikbackup`` バイナリをパスフレーズで復号して平文を返す。
+
+    パスフレーズ違い / 改ざん / フォーマット不一致は例外を送出する。
+    """
+    _assert_backup_passphrase(passphrase)
+    archive = bytes(archive)
+    if len(archive) < _IKBACKUP_HEADER_LEN:
+        raise ValueError("archive too short")
+    if archive[:8] != _IKBACKUP_MAGIC:
+        raise ValueError("invalid magic (not a .ikbackup file)")
+    if archive[8] != _IKBACKUP_VERSION:
+        raise ValueError(f"unsupported version: {archive[8]}")
+    memory, iterations, parallelism = struct.unpack(">III", archive[12:24])
+    salt = archive[24:40]
+    iv = archive[40:52]
+    len_lo, len_hi = struct.unpack(">II", archive[52:60])
+    ct_len = (len_hi << 32) + len_lo
+    if len(archive) != _IKBACKUP_HEADER_LEN + ct_len:
+        raise ValueError("archive length mismatch")
+    aad = archive[:40]
+    derived = derive_key(
+        passphrase, salt,
+        {"memory": memory, "iterations": iterations, "parallelism": parallelism},
+    )
+    return AESGCM(derived).decrypt(iv, archive[_IKBACKUP_HEADER_LEN:], aad)
+
+
 # --- OS keyring への MK 永続化 (§15.1) ---
 
 KEYRING_SERVICE = "iikanji-kakeibo"

@@ -314,3 +314,36 @@ with KakeiboClient("https://example.com", "ik_your_key") as client:
 
 `aad_id` は画像を再取得・復号する際の AAD 束縛に必須です。`voucher_id` は backup/restore で
 再採番されることがありますが、`aad_id` は保持されるため復号互換が保たれます。
+
+## 全データバックアップ / リストア
+
+`.ikbackup`（MK と独立したパスフレーズで暗号化したアーカイブ）で全データを保存・復元します。
+アーカイブは暗号文 backup をそのまま包むため、サーバーは平文を一切持ちません。
+
+```python
+from iikanji import KakeiboClient, crypto
+
+with KakeiboClient("https://example.com", "ik_your_key") as client:
+    # 暗号文 backup をパスフレーズアーカイブ (.ikbackup) として保存 (MK 不要)
+    client.save_encrypted_backup("backup.ikbackup", "disaster-passphrase")
+
+    # アーカイブから全置換リストア (backup:restore スコープが必要)
+    restored = client.restore_encrypted_backup("backup.ikbackup", "disaster-passphrase")
+    print(restored)  # {"tables": {...}} 復元件数
+```
+
+中身を人間可読に取り出したいときは MK 解錠して復号エクスポートします（復元には使えません）。
+
+```python
+with KakeiboClient("https://example.com", "ik_your_key") as client:
+    if not client.is_unlocked:
+        client.unlock("あなたのパスフレーズ")
+    decrypted = client.export_backup_decrypted()
+    for e in decrypted["data"]["journal_entries"]:
+        print(e.get("date"), e.get("description"))
+```
+
+`.ikbackup` のアーカイブ形式（Argon2id + AES-256-GCM）は Web の設定画面（バックアップ）と
+共通で、どちら側でも復号できます。ただし中身は異なります — client-py は**暗号文 backup**
+（復元可能）を包むのに対し、Web のエクスポートは**復号済み平文**（人間可読、復元には不向き）
+を包みます。パスフレーズは 8 文字以上が必要です。
