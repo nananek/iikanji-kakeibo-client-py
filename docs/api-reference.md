@@ -255,6 +255,51 @@ trial_balance(*, fiscal_year: int, include_closing: bool = False) -> TrialBalanc
 `total_debit`, `total_credit`）。`TrialBalanceRow` = `code` / `name` / `account_type`
 / `debit` / `credit` / `balance`。
 
+#### `profit_loss`
+
+損益計算書（P/L）を集計する。必要なスコープ: `journals:read`（要 MK 解錠）
+
+```python
+profit_loss(*, fiscal_year: int, month: int | None = None) -> ProfitLoss
+```
+
+収益・費用科目の発生額を集計します。`month`（1-12）を指定すると当該月のみ、未指定なら
+年間（損益振替・closing 仕訳は除外）。**戻り値:** `ProfitLoss`（`income_total` /
+`expense_total` / `net_income` / `income_breakdown` / `expense_breakdown: list[ProfitLossRow]`
+/ `month`）。`ProfitLossRow` = `account_code` / `account_name` / `amount`。
+
+#### `balance_sheet`
+
+貸借対照表（B/S）を集計する。必要なスコープ: `journals:read`（要 MK 解錠）
+
+```python
+balance_sheet(*, fiscal_year: int) -> BalanceSheet
+```
+
+資産・負債・純資産の残高を集計します。前年末（year-1, period=15）の残高キャッシュを期首
+累計に流すため年度末残高になります（キャッシュ欠落時は当年度のみで degraded）。損益振替前
+は当期純利益を純資産側に加算します。**戻り値:** `BalanceSheet`（`assets` / `liabilities` /
+`equities: list[BalanceSheetRow]`, `total_assets` / `total_liabilities` / `total_equity` /
+`net_income` / `has_closing` / `total_liability_and_equity`）。`BalanceSheetRow` =
+`account_code` / `account_name` / `balance`。
+
+#### `ledger`
+
+総勘定元帳を集計する。必要なスコープ: `journals:read`（要 MK 解錠）
+
+```python
+ledger(*, fiscal_year: int, account_code: str, opening_balance: int = 0,
+       include_closing: bool = True) -> Ledger
+```
+
+当該科目の明細を `entry.id` 昇順（作成順 ≈ 時系列。date は暗号化のためサーバの日付順は
+再現不可）で並べ、各行で running balance を計算します。`opening_balance` に前年度元帳の
+`closing_balance` を渡すと累計表示になります。account_code が存在しないと 404。
+**戻り値:** `Ledger`（`account_code` / `account_name` / `opening_balance` /
+`rows: list[LedgerRow]` / `closing_balance` / `total_debit` / `total_credit`）。`LedgerRow`
+= `entry_id` / `fiscal_period` / `date` / `description` / `debit` / `credit` / `balance` /
+`counterparts`（相手科目コードのカンマ区切り）。
+
 #### `analyze`
 
 画像を AI 解析して下書きを作成する。必要なスコープ: `ai:analyze`

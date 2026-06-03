@@ -19,6 +19,8 @@ from iikanji import (
     JournalListResponse,
     KakeiboAPIError,
     KakeiboClient,
+    Ledger,
+    LedgerRow,
     LockedError,
     MedicalExpense,
     MedicalExpenseListResponse,
@@ -2351,3 +2353,81 @@ class TestSendSnapshot:
         client = _audit_client(_snapshot_handler())
         with client, pytest.raises(ValueError):
             client.send_snapshot(audit_grant_id=7, round_id=1, auditor_user_id=8, level=5)
+
+
+# ========== スタンドアロン P/L・B/S・元帳 ==========
+
+
+class TestProfitLossStandalone:
+    def test_annual(self) -> None:
+        client = _audit_client(_snapshot_handler())
+        with client:
+            pl = client.profit_loss(fiscal_year=2026)
+        assert pl.fiscal_year == 2026 and pl.month is None
+        assert pl.income_total == 5000 and pl.expense_total == 5000
+        assert pl.net_income == 0
+        codes = {r.account_code for r in pl.expense_breakdown}
+        assert codes == {"7010", "7020"}
+        assert pl.income_breakdown[0].account_name == "売上"
+
+    def test_month_filter(self) -> None:
+        client = _audit_client(_snapshot_handler())
+        with client:
+            pl = client.profit_loss(fiscal_year=2026, month=2)
+        assert pl.month == 2
+        # 2月は 7020 (社会保険料 2000) のみ、売上なし
+        assert pl.expense_total == 2000
+        assert pl.income_total == 0
+
+    def test_locked(self) -> None:
+        client = _audit_client(_snapshot_handler(), unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.profit_loss(fiscal_year=2026)
+
+
+class TestBalanceSheetStandalone:
+    def test_structure(self) -> None:
+        client = _audit_client(_snapshot_handler())
+        with client:
+            bs = client.balance_sheet(fiscal_year=2026)
+        assert bs.fiscal_year == 2026
+        assert bs.has_closing is False
+        # prior 無し: 現金 = 5000(debit) - 5000(credit) = 0 → assets から除外
+        assert bs.total_assets == 0
+        assert isinstance(bs.assets, list)
+
+    def test_locked(self) -> None:
+        client = _audit_client(_snapshot_handler(), unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.balance_sheet(fiscal_year=2026)
+
+
+class TestLedgerStandalone:
+    def test_cash_ledger(self) -> None:
+        client = _audit_client(_snapshot_handler())
+        with client:
+            led = client.ledger(fiscal_year=2026, account_code="1010")
+        assert led.account_code == "1010" and led.account_name == "現金"
+        assert led.total_debit == 5000 and led.total_credit == 5000
+        assert led.closing_balance == 0
+        assert len(led.rows) == 3
+        assert led.rows[0].counterparts == "7010"
+        assert isinstance(led.rows[0], LedgerRow)
+
+    def test_opening_balance(self) -> None:
+        client = _audit_client(_snapshot_handler())
+        with client:
+            led = client.ledger(fiscal_year=2026, account_code="1010", opening_balance=10000)
+        assert led.opening_balance == 10000
+        assert led.closing_balance == 10000
+
+    def test_unknown_account(self) -> None:
+        client = _audit_client(_snapshot_handler())
+        with client, pytest.raises(KakeiboAPIError) as exc:
+            client.ledger(fiscal_year=2026, account_code="9999")
+        assert exc.value.status_code == 404
+
+    def test_locked(self) -> None:
+        client = _audit_client(_snapshot_handler(), unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.ledger(fiscal_year=2026, account_code="1010")

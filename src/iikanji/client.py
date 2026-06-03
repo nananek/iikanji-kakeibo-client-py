@@ -25,8 +25,14 @@ from .models import (
     JournalDetail,
     JournalLine,
     JournalListResponse,
+    BalanceSheet,
+    BalanceSheetRow,
+    Ledger,
+    LedgerRow,
     MedicalExpense,
     MedicalExpenseListResponse,
+    ProfitLoss,
+    ProfitLossRow,
     TrialBalance,
     TrialBalanceRow,
     VoucherListItem,
@@ -606,6 +612,143 @@ class KakeiboClient:
             rows=rows,
             total_debit=sum(r.debit for r in rows),
             total_credit=sum(r.credit for r in rows),
+        )
+
+    def profit_loss(
+        self, *, fiscal_year: int, month: int | None = None
+    ) -> ProfitLoss:
+        """損益計算書 (P/L) を集計する (E2EE)。必要なスコープ: ``journals:read``
+
+        収益・費用科目の発生額を集計します。``month`` (1-12) を指定すると当該月のみ、
+        未指定なら年間 (期首/通常月/決算整理を含み、損益振替と closing 仕訳は除外)。
+
+        Args:
+            fiscal_year: 対象年度
+            month: 1-12 を指定すると当該月の P/L (未指定で年間)
+
+        Returns:
+            ProfitLoss
+
+        Raises:
+            LockedError: MK が未解錠の場合
+        """
+        self._require_mk()
+        meta = self._accounts_meta()
+        type_by = {c: m["type"] for c, m in meta.items()}
+        name_by = {c: m["name"] for c, m in meta.items()}
+        entries = [
+            self._entry_to_report_dict(jd)
+            for jd in self._iter_all_journals(fiscal_year)
+        ]
+        pl = reports.compute_profit_loss(
+            entries, account_type_by_code=type_by,
+            account_name_by_code=name_by, month=month,
+        )
+        return ProfitLoss(
+            fiscal_year=fiscal_year,
+            income_total=pl["income_total"],
+            expense_total=pl["expense_total"],
+            net_income=pl["net_income"],
+            income_breakdown=[ProfitLossRow(**r) for r in pl["income_breakdown"]],
+            expense_breakdown=[ProfitLossRow(**r) for r in pl["expense_breakdown"]],
+            month=month,
+        )
+
+    def balance_sheet(self, *, fiscal_year: int) -> BalanceSheet:
+        """貸借対照表 (B/S) を集計する (E2EE)。必要なスコープ: ``journals:read``
+
+        資産・負債・純資産の残高を集計します。前年末 (year-1, period=15) の残高
+        キャッシュを期首累計に流すため、過去分も反映した年度末残高になります
+        (キャッシュ欠落時は当年度の仕訳のみで degraded 集計)。損益振替前は当期純利益
+        を純資産側に加算します。
+
+        Returns:
+            BalanceSheet
+
+        Raises:
+            LockedError: MK が未解錠の場合
+        """
+        self._require_mk()
+        meta = self._accounts_meta()
+        type_by = {c: m["type"] for c, m in meta.items()}
+        nb_by = {c: m["normal_balance"] for c, m in meta.items()}
+        name_by = {c: m["name"] for c, m in meta.items()}
+        entries = [
+            self._entry_to_report_dict(jd)
+            for jd in self._iter_all_journals(fiscal_year)
+        ]
+        try:
+            prior = self.list_balance_cache_blobs(fiscal_year - 1).get(15, {})
+        except Exception:
+            prior = {}
+        bs = reports.compute_balance_sheet(
+            entries, account_type_by_code=type_by,
+            normal_balance_by_code=nb_by, account_name_by_code=name_by,
+            prior_cumulative=prior,
+        )
+        return BalanceSheet(
+            fiscal_year=fiscal_year,
+            assets=[BalanceSheetRow(**r) for r in bs["assets"]],
+            liabilities=[BalanceSheetRow(**r) for r in bs["liabilities"]],
+            equities=[BalanceSheetRow(**r) for r in bs["equities"]],
+            total_assets=bs["total_assets"],
+            total_liabilities=bs["total_liabilities"],
+            total_equity=bs["total_equity"],
+            net_income=bs["net_income"],
+            has_closing=bs["has_closing"],
+            total_liability_and_equity=bs["total_liability_and_equity"],
+        )
+
+    def ledger(
+        self,
+        *,
+        fiscal_year: int,
+        account_code: str,
+        opening_balance: int = 0,
+        include_closing: bool = True,
+    ) -> Ledger:
+        """指定科目の総勘定元帳を集計する (E2EE)。必要なスコープ: ``journals:read``
+
+        当該科目の明細を ``entry.id`` 昇順 (作成順 ≈ 時系列。date は暗号化のため
+        サーバの日付順は再現不可) で並べ、各行で running balance を計算します。
+
+        Args:
+            fiscal_year: 対象年度
+            account_code: 対象勘定科目コード
+            opening_balance: 期首残高 (前期繰越)。前年度元帳の ``closing_balance``
+                を渡すと累計表示になる。
+            include_closing: 損益振替 (is_closing) 仕訳を含めるか (既定 True)
+
+        Returns:
+            Ledger
+
+        Raises:
+            LockedError: MK が未解錠の場合
+            KakeiboAPIError: account_code が存在しない場合 (404)
+        """
+        self._require_mk()
+        accounts = {a.code: a for a in self.list_accounts()}
+        acct = accounts.get(account_code)
+        if acct is None:
+            raise KakeiboAPIError(404, f"科目 {account_code} が見つかりません。")
+        entries = [
+            self._entry_to_report_dict(jd)
+            for jd in self._iter_all_journals(fiscal_year)
+        ]
+        led = reports.compute_ledger(
+            entries, account_code=account_code,
+            normal_balance=acct.normal_balance,
+            opening_balance=opening_balance, include_closing=include_closing,
+        )
+        return Ledger(
+            fiscal_year=fiscal_year,
+            account_code=account_code,
+            account_name=acct.name,
+            opening_balance=led["opening_balance"],
+            rows=[LedgerRow(**r) for r in led["rows"]],
+            closing_balance=led["closing_balance"],
+            total_debit=led["total_debit"],
+            total_credit=led["total_credit"],
         )
 
     # --- AI 証憑仕訳 ---

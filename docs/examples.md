@@ -422,3 +422,32 @@ with KakeiboClient("https://example.com", "ik_owner_key") as owner:
 スナップショットの暗号化は suite = DHKEM-X25519-HKDF-SHA256 / HKDF-SHA256 / AES-256-GCM
 （RFC 9180）で、Web の `@hpke/core` と相互運用できます。集計（試算表 / P/L / B/S / 月次 /
 税務集計）は Web の `crypto/reports/*.js` と出力構造が一致します。
+
+## レポート集計（試算表 / P/L / B/S / 元帳）
+
+仕訳を復号してクライアント側で各種レポートを集計します（要 MK 解錠、`journals:read`）。
+
+```python
+from iikanji import KakeiboClient
+
+with KakeiboClient("https://example.com", "ik_your_key") as client:
+    client.unlock("あなたのパスフレーズ")
+
+    tb = client.trial_balance(fiscal_year=2026)          # 試算表
+    print(tb.total_debit, tb.total_credit)
+
+    pl = client.profit_loss(fiscal_year=2026)            # 損益計算書 (年間)
+    print("当期純利益:", pl.net_income)
+    pl_jan = client.profit_loss(fiscal_year=2026, month=1)  # 1月のみ
+
+    bs = client.balance_sheet(fiscal_year=2026)          # 貸借対照表
+    print("資産合計:", bs.total_assets)
+
+    led = client.ledger(fiscal_year=2026, account_code="1010")  # 現金の元帳
+    for row in led.rows:
+        print(row.date, row.debit, row.credit, row.balance, row.counterparts)
+    print("期末残高:", led.closing_balance)
+```
+
+集計ロジック（`iikanji.reports` の純粋関数）は Web の `crypto/reports/*.js` と出力構造が
+一致します。元帳は date が暗号化されているため `entry.id` 昇順（作成順 ≈ 時系列）で並びます。
