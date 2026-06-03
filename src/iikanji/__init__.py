@@ -18,6 +18,9 @@ from .models import (
     MedicalExpenseListResponse,
     TrialBalance,
     TrialBalanceRow,
+    VoucherListItem,
+    VoucherListResponse,
+    VoucherUploadResult,
 )
 
 __all__ = [
@@ -31,6 +34,9 @@ __all__ = [
     "Account",
     "TrialBalance",
     "TrialBalanceRow",
+    "VoucherListItem",
+    "VoucherListResponse",
+    "VoucherUploadResult",
     "AnalyzeResponse",
     "DraftDetail",
     "DraftListItem",

@@ -368,6 +368,58 @@ class TrialBalance:
     total_credit: int
 
 
+# --- 証憑画像 (E2EE, E4 #111 Option C) ---
+
+
+@dataclass
+class VoucherUploadResult:
+    """証憑アップロード結果 (init → encrypt → PUT)。
+
+    ``aad_id`` は voucher_id と独立した安定識別子で、後で画像を再 fetch して
+    復号する (:meth:`KakeiboClient.download_voucher_image`) 際に AAD 束縛に使う。
+    backup/restore で PK が再採番されても aad_id は保持されるため復号互換を保つ。
+    """
+
+    voucher_id: int
+    aad_id: int  # AAD 束縛用安定識別子 (63bit)
+    file_hash_cipher: str  # サーバ計算の SHA-256(暗号文)
+    file_hash_plain: str  # クライアント計算の SHA-256(平文画像)
+    has_thumbnail: bool
+
+
+@dataclass
+class VoucherListItem:
+    """証憑一覧の 1 件 (``GET /api/v1/vouchers``)。"""
+
+    id: int
+    journal_entry_id: int | None
+    aad_id: int | None  # 平文レガシー証憑は None (E2EE 証憑のみ復号可)
+    uploaded_at: str | None
+    amount: int | None  # 紐付く仕訳の借方合計 (孤立証憑は None)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> VoucherListItem:
+        raw_aad = d.get("aad_id")
+        journal = d.get("journal") or {}
+        return cls(
+            id=d["id"],
+            journal_entry_id=d.get("journal_entry_id"),
+            aad_id=int(raw_aad) if raw_aad is not None else None,
+            uploaded_at=d.get("uploaded_at"),
+            amount=journal.get("amount"),
+        )
+
+
+@dataclass
+class VoucherListResponse:
+    """証憑一覧レスポンス"""
+
+    vouchers: list[VoucherListItem]
+    total: int
+    page: int
+    per_page: int
+
+
 # --- AI 証憑仕訳 ---
 
 

@@ -1,7 +1,8 @@
 # iikanji — いいかんじ家計簿 Python クライアント
 
 いいかんじ家計簿サーバーの API を Python から呼び出すためのクライアントライブラリです。
-仕訳の起票・閲覧・削除、AI 証憑仕訳（画像解析・下書き管理）に対応しています。
+仕訳の起票・閲覧・削除、AI 証憑仕訳（画像解析・下書き管理）、証憑画像の E2EE
+保存（アップロード・取得・サムネ生成）に対応しています。
 
 ## E2EE（エンドツーエンド暗号化）について
 
@@ -72,6 +73,32 @@ with KakeiboClient("https://your-server.example.com", "ik_your_api_key") as clie
         draft_id=result.draft_id,  # 下書きを確定済みにする
     )
 ```
+
+### 証憑画像の E2EE 保存
+
+```python
+from iikanji import KakeiboClient, crypto
+
+with KakeiboClient("https://your-server.example.com", "ik_your_api_key") as client:
+    if not client.is_unlocked:
+        client.unlock("あなたのパスフレーズ")
+
+    # 画像を暗号化して 2 段階アップロード（サムネは Pillow で自動生成）
+    v = client.upload_voucher("receipt.jpg", journal_entry_id=123)
+    print(f"証憑ID: {v.voucher_id}, aad_id: {v.aad_id}")
+
+    # 一覧から aad_id を取得して画像を復号取得
+    for item in client.list_vouchers().vouchers:
+        if item.aad_id is not None:  # E2EE 証憑のみ復号可能
+            data = client.download_voucher_image(item.id, item.aad_id)
+            ext = crypto.sniff_image_mime(data).split("/")[-1]  # jpeg / png ...
+            with open(f"voucher_{item.id}.{ext}", "wb") as f:
+                f.write(data)
+```
+
+画像・サムネ・メタはクライアントで暗号化され、サーバーには暗号文しか渡りません。`aad_id`
+は画像の再取得・復号に必須なので保存しておいてください（backup/restore で `voucher_id` が
+再採番されても `aad_id` は保持されます）。
 
 API キーはサーバーの **設定 > API キー管理** から発行できます。必要なスコープ（`journals:create`, `journals:read`, `journals:delete`, `ai:analyze`）を選択してください。
 

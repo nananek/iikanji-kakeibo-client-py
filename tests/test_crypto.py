@@ -128,6 +128,130 @@ class TestInteropGoldenVectors:
         assert rec == {"1010": [50000, 20000], "5010": [12000, 0]}
 
 
+# 証憑画像 (E4 #111 Option C) の golden vector。同じ固定 MK、user_id=42、
+# aad_id=123456789012345 で server JS (record.js buildAAD + WebCrypto AES-GCM) が
+# 生成した値。vimg/vthumb は opaque blob (iv || ct || tag)、vmeta は record。
+GOLDEN_VOUCHER_AAD_ID = 123456789012345
+GOLDEN_VIMG_AAD_HEX = "76696d6700000000000000002a0000007048860ddf79"
+GOLDEN_VTHUMB_AAD_HEX = "767468756d6200000000000000002a0000007048860ddf79"
+GOLDEN_VMETA_AAD_HEX = "766d65746100000000000000002a0000007048860ddf79"
+GOLDEN_IMAGE_BYTES = bytes.fromhex(
+    "89504e470d0a1a0a0000000d494844520102030405060708"
+)
+GOLDEN_VIMG_BLOB = base64.b64decode(
+    "EBESExQVFhcYGRobN9Sdl3eCX+nTsitEWjuPERHghAkEPkADmxxWteRxsK3C2k33HOqxeg=="
+)
+GOLDEN_VMETA_IV = base64.b64decode("MDEyMzQ1Njc4OTo7")
+GOLDEN_VMETA_BLOB = base64.b64decode(
+    "TK72zlDWVQZcQYHf6TZUg1/8dkeB81VkrX9EZ57+ZI1rJ7UgQ2n+wKAvux4xVAdR5OoqkDSArTWTbTW5JQav4iAq0SiQl7qtOiiJaQNpHK78bytR"
+)
+GOLDEN_VMETA_RECORD = {
+    "v": 1,
+    "original_filename": "領収書.png",
+    "image_mime": "image/png",
+}
+
+
+class TestVoucherInterop:
+    def test_vimg_aad_matches_js(self) -> None:
+        aad = crypto.build_aad("vimg", GOLDEN_USER_ID, GOLDEN_VOUCHER_AAD_ID)
+        assert aad.hex() == GOLDEN_VIMG_AAD_HEX
+
+    def test_vthumb_aad_matches_js(self) -> None:
+        aad = crypto.build_aad("vthumb", GOLDEN_USER_ID, GOLDEN_VOUCHER_AAD_ID)
+        assert aad.hex() == GOLDEN_VTHUMB_AAD_HEX
+
+    def test_vmeta_aad_matches_js(self) -> None:
+        aad = crypto.build_aad("vmeta", GOLDEN_USER_ID, GOLDEN_VOUCHER_AAD_ID)
+        assert aad.hex() == GOLDEN_VMETA_AAD_HEX
+
+    def test_decrypt_blob_matches_js(self) -> None:
+        """JS が生成した opaque blob (iv||ct||tag) を Python が復号一致。"""
+        mk = bytes.fromhex(GOLDEN_MK_HEX)
+        aad = crypto.build_aad("vimg", GOLDEN_USER_ID, GOLDEN_VOUCHER_AAD_ID)
+        assert crypto.decrypt_blob(mk, GOLDEN_VIMG_BLOB, aad) == GOLDEN_IMAGE_BYTES
+
+    def test_encrypt_blob_byte_identical_to_js(self) -> None:
+        """同じ MK / IV / AAD で JS と同じ opaque blob を生成する。"""
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        mk = bytes.fromhex(GOLDEN_MK_HEX)
+        aad = crypto.build_aad("vimg", GOLDEN_USER_ID, GOLDEN_VOUCHER_AAD_ID)
+        iv = GOLDEN_VIMG_BLOB[:12]
+        ct = AESGCM(mk).encrypt(iv, GOLDEN_IMAGE_BYTES, aad)
+        assert iv + ct == GOLDEN_VIMG_BLOB
+
+    def test_decrypt_vmeta_record_matches_js(self) -> None:
+        mk = bytes.fromhex(GOLDEN_MK_HEX)
+        aad = crypto.build_aad("vmeta", GOLDEN_USER_ID, GOLDEN_VOUCHER_AAD_ID)
+        rec = crypto.decrypt_record(mk, GOLDEN_VMETA_BLOB, GOLDEN_VMETA_IV, aad)
+        assert rec == GOLDEN_VMETA_RECORD
+
+    def test_encrypt_vmeta_byte_identical_to_js(self) -> None:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        mk = bytes.fromhex(GOLDEN_MK_HEX)
+        aad = crypto.build_aad("vmeta", GOLDEN_USER_ID, GOLDEN_VOUCHER_AAD_ID)
+        pt = json.dumps(
+            GOLDEN_VMETA_RECORD, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        ct = AESGCM(mk).encrypt(GOLDEN_VMETA_IV, pt, aad)
+        assert ct == GOLDEN_VMETA_BLOB
+
+
+class TestVoucherBlob:
+    def test_round_trip(self) -> None:
+        mk = os.urandom(32)
+        aad = crypto.build_aad("vimg", 7, 999)
+        data = os.urandom(1234)
+        blob = crypto.encrypt_blob(mk, data, aad)
+        # 先頭 12B は IV。残りは ct||tag。
+        assert len(blob) == 12 + len(data) + 16
+        assert crypto.decrypt_blob(mk, blob, aad) == data
+
+    def test_random_iv_each_call(self) -> None:
+        mk = os.urandom(32)
+        aad = crypto.build_aad("vthumb", 7, 999)
+        b1 = crypto.encrypt_blob(mk, b"abc", aad)
+        b2 = crypto.encrypt_blob(mk, b"abc", aad)
+        assert b1[:12] != b2[:12]
+
+    def test_aad_mismatch_fails(self) -> None:
+        from cryptography.exceptions import InvalidTag
+
+        mk = os.urandom(32)
+        blob = crypto.encrypt_blob(mk, b"x", crypto.build_aad("vimg", 1, 5))
+        with pytest.raises(InvalidTag):
+            crypto.decrypt_blob(mk, blob, crypto.build_aad("vthumb", 1, 5))
+
+    def test_too_short_raises(self) -> None:
+        with pytest.raises(ValueError):
+            crypto.decrypt_blob(os.urandom(32), b"short", crypto.build_aad("vimg", 1, 5))
+
+    def test_sha256_hex(self) -> None:
+        assert crypto.sha256_hex(b"") == (
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        )
+
+
+class TestSniffImageMime:
+    def test_jpeg(self) -> None:
+        assert crypto.sniff_image_mime(b"\xff\xd8\xff\xe0xxxx") == "image/jpeg"
+
+    def test_png(self) -> None:
+        assert crypto.sniff_image_mime(b"\x89PNG\r\n\x1a\n") == "image/png"
+
+    def test_gif(self) -> None:
+        assert crypto.sniff_image_mime(b"GIF89a..") == "image/gif"
+
+    def test_webp(self) -> None:
+        assert crypto.sniff_image_mime(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "image/webp"
+
+    def test_unknown(self) -> None:
+        assert crypto.sniff_image_mime(b"\x00\x01\x02\x03") == "application/octet-stream"
+        assert crypto.sniff_image_mime(b"ab") == "application/octet-stream"
+
+
 class TestAAD:
     def test_je_jel_me_no_extra_id(self) -> None:
         assert crypto.build_aad("je", 1) == b"je\x00" + struct.pack(">Q", 1)

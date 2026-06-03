@@ -336,6 +336,79 @@ delete_draft(draft_id: int) -> None
 |------|-----|------|
 | `draft_id` | `int` | 下書き ID |
 
+#### `upload_voucher`
+
+証憑画像を E2EE で 2 段階アップロードする。必要なスコープ: `journals:create`（要 MK 解錠）
+
+画像・サムネ・メタはクライアントで AES-GCM 暗号化され、サーバーには暗号文しか渡りません
+（設計書 §13）。フロー: `POST /vouchers/init` で `voucher_id` + `aad_id` を採番 → `aad_id`
+を AAD に束縛して暗号化（`vimg` 本体 / `vthumb` サムネ / `vmeta` メタ）→ `PUT /vouchers/<id>`
+で暗号文を multipart upload。
+
+```python
+upload_voucher(
+    image: str | Path | bytes,
+    *,
+    journal_entry_id: int | None = None,
+    make_thumbnail: bool = True,
+    original_filename: str | None = None,
+    image_mime: str | None = None,
+) -> VoucherUploadResult
+```
+
+| 引数 | 型 | 説明 |
+|------|-----|------|
+| `image` | `str \| Path \| bytes` | 画像ファイルパスまたはバイト列（平文上限 10MB） |
+| `journal_entry_id` | `int \| None` | 紐付ける仕訳 ID（孤立証憑なら None） |
+| `make_thumbnail` | `bool` | True なら Pillow で長辺 200px JPEG サムネを生成して同梱 |
+| `original_filename` | `str \| None` | メタに保存する元ファイル名（パス渡しなら自動） |
+| `image_mime` | `str \| None` | メタの MIME（省略時はマジックナンバーから判定） |
+
+**戻り値:** `VoucherUploadResult`（`voucher_id` / `aad_id` / `file_hash_cipher` /
+`file_hash_plain` / `has_thumbnail`）。`aad_id` は後で画像を再取得・復号する際に必須です。
+
+#### `download_voucher_image`
+
+証憑画像（またはサムネ）を取得して MK で復号し、平文バイト列を返す。必要なスコープ:
+`journals:read`（要 MK 解錠）
+
+```python
+download_voucher_image(voucher_id: int, aad_id: int, *, thumb: bool = False) -> bytes
+```
+
+`aad_id` は `upload_voucher` の戻り値、または `list_vouchers` の各 `VoucherListItem.aad_id`
+から得ます。`thumb=True` はサムネ（`?size=thumb`）を取得しますが、サムネが存在しない証憑に
+渡すとサーバーが本体にフォールバックするため復号に失敗する点に注意してください。MIME は
+`crypto.sniff_image_mime(bytes)` で判定できます。
+
+#### `list_vouchers`
+
+証憑一覧を取得する。必要なスコープ: `journals:read`（MK 解錠は不要 — 一覧メタのみ）
+
+```python
+list_vouchers(
+    *,
+    page: int = 1,
+    per_page: int = 20,
+    amount_from: int | None = None,
+    amount_to: int | None = None,
+) -> VoucherListResponse
+```
+
+各件の `aad_id` を `download_voucher_image` に渡して画像を復号します。`amount_from` /
+`amount_to` は紐付く仕訳の借方合計での絞り込みです。
+
+#### `verify_voucher`
+
+サーバー側で暗号文ハッシュ（`file_hash_cipher`）を再計算して検証する（電帳法の改ざん検知）。
+必要なスコープ: `journals:read`（MK 不要 — サーバーは平文に触れません）
+
+```python
+verify_voucher(voucher_id: int) -> dict
+```
+
+**戻り値:** `{"ok", "verified", "stored_hash", "computed_hash"}` 等の生 JSON。
+
 #### `close`
 
 内部の HTTP クライアントを閉じる。コンテキストマネージャ使用時は自動的に呼ばれる。
