@@ -347,3 +347,24 @@ with KakeiboClient("https://example.com", "ik_your_key") as client:
 共通で、どちら側でも復号できます。ただし中身は異なります — client-py は**暗号文 backup**
 （復元可能）を包むのに対し、Web のエクスポートは**復号済み平文**（人間可読、復元には不向き）
 を包みます。パスフレーズは 8 文字以上が必要です。
+
+## CSV + 画像 zip エクスポート
+
+CLI（`iikanji export`）と同じ zip をプログラムから生成できます。
+
+```python
+from iikanji import KakeiboClient
+from iikanji.export import build_export_zip
+
+with KakeiboClient("https://example.com", "ik_your_key") as client:
+    if not client.is_unlocked:
+        client.unlock("あなたのパスフレーズ")
+    result = build_export_zip(client)  # journals:read スコープ
+    with open("export.zip", "wb") as f:
+        f.write(result.zip_bytes)
+    print(f"復号失敗 {result.decrypt_failures} 件 / 画像取得失敗 {result.image_failures} 件")
+```
+
+zip には `journal.csv` / `accounts.csv` / `medical.csv` / `vouchers.csv`（UTF-8 BOM）、
+復号済みの証憑画像（`vouchers/voucher_<id>.<ext>`）、`backup.json`（暗号文・リストア用）、
+`README.txt` が含まれます。復号できなかったレコードは CSV 上 `(復号失敗)` と表示されます。
