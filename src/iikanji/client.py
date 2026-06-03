@@ -21,6 +21,8 @@ from .models import (
     JournalDetail,
     JournalLine,
     JournalListResponse,
+    MedicalExpense,
+    MedicalExpenseListResponse,
 )
 
 if TYPE_CHECKING:
@@ -312,6 +314,91 @@ class KakeiboClient:
         resp = self._client.delete(f"/api/v1/journals/{journal_id}")
         if resp.status_code == 200:
             return
+        self._raise_for_error(resp)
+
+    # --- 医療費 ---
+
+    def upsert_medical_expense(
+        self,
+        *,
+        journal_entry_id: int,
+        date: str | None = None,
+        patient_name: str = "",
+        hospital_name: str = "",
+        treatment_description: str = "",
+        provider_type: str | None = None,
+        amount_paid: int = 0,
+        insurance_reimbursement: int = 0,
+    ) -> int:
+        """医療費明細を作成または更新する (E2EE: MK で暗号化して送信)。
+
+        ``journal_entry_id`` で upsert する（1 仕訳につき医療費明細は 1 件）。
+        事前に :meth:`unlock` で MK を解錠しておく必要がある。
+
+        Args:
+            journal_entry_id: 紐付ける仕訳 ID（必須、その仕訳が存在すること）
+            date: 受診日 (YYYY-MM-DD) または None
+            patient_name: 受診者名
+            hospital_name: 病院・薬局名
+            treatment_description: 治療内容
+            provider_type: ``"hospital"`` / ``"pharmacy"`` / ``"nursing"`` /
+                ``"other"`` または None
+            amount_paid: 支払額（非負整数）
+            insurance_reimbursement: 保険などで補填される額（非負整数）
+
+        Returns:
+            int: 作成・更新された医療費明細の ID
+
+        Raises:
+            LockedError: MK が未解錠の場合
+            KakeiboAPIError: 仕訳が見つからない (404)、確定済み期間 (400) 等
+        """
+        mk, user_id = self._require_mk()
+        me = MedicalExpense(
+            journal_entry_id=journal_entry_id,
+            date=date,
+            patient_name=patient_name,
+            hospital_name=hospital_name,
+            treatment_description=treatment_description,
+            provider_type=provider_type,
+            amount_paid=amount_paid,
+            insurance_reimbursement=insurance_reimbursement,
+        )
+        resp = self._client.post(
+            "/api/v1/medical-expenses", json=me.to_wire(mk, user_id)
+        )
+        if resp.status_code == 200:
+            return resp.json()["id"]
+        self._raise_for_error(resp)
+
+    def list_medical_expenses(
+        self, *, fiscal_year: int | None = None
+    ) -> MedicalExpenseListResponse:
+        """医療費明細の一覧を取得する (E2EE: MK で各明細を復号して返す)。
+
+        Args:
+            fiscal_year: 年度フィルタ（省略可、紐付く仕訳の年度で絞り込み）
+
+        Returns:
+            MedicalExpenseListResponse: 医療費明細の一覧
+
+        Raises:
+            LockedError: MK が未解錠の場合
+        """
+        mk, user_id = self._require_mk()
+        params: dict[str, str | int] = {}
+        if fiscal_year is not None:
+            params["fiscal_year"] = fiscal_year
+        resp = self._client.get("/api/v1/medical-expenses", params=params)
+        if resp.status_code == 200:
+            data = resp.json()
+            return MedicalExpenseListResponse(
+                expenses=[
+                    MedicalExpense.from_api(e, mk, user_id)
+                    for e in data["expenses"]
+                ],
+                total=data["total"],
+            )
         self._raise_for_error(resp)
 
     # --- AI 証憑仕訳 ---

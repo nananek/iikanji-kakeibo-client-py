@@ -141,6 +141,57 @@ delete_journal(journal_id: int) -> None
 
 **例外:** 確定済み期間や提出ロック中の仕訳は削除不可（`KakeiboAPIError` 400）
 
+#### `upsert_medical_expense`
+
+医療費明細を作成または更新する。必要なスコープ: `journals:create`（要 MK 解錠）
+
+`journal_entry_id` で upsert します（1 仕訳につき医療費明細は 1 件）。本体は MK で
+暗号化して送信されます。
+
+```python
+upsert_medical_expense(
+    *,
+    journal_entry_id: int,
+    date: str | None = None,
+    patient_name: str = "",
+    hospital_name: str = "",
+    treatment_description: str = "",
+    provider_type: str | None = None,
+    amount_paid: int = 0,
+    insurance_reimbursement: int = 0,
+) -> int
+```
+
+| 引数 | 型 | 説明 |
+|------|-----|------|
+| `journal_entry_id` | `int` | 紐付ける仕訳 ID（必須、その仕訳が存在すること） |
+| `date` | `str \| None` | 受診日（`"YYYY-MM-DD"`）または None |
+| `patient_name` | `str` | 受診者名 |
+| `hospital_name` | `str` | 病院・薬局名 |
+| `treatment_description` | `str` | 治療内容 |
+| `provider_type` | `str \| None` | `"hospital"` / `"pharmacy"` / `"nursing"` / `"other"` または None |
+| `amount_paid` | `int` | 支払額（非負整数） |
+| `insurance_reimbursement` | `int` | 保険などの補填額（非負整数） |
+
+**戻り値:** `int`（医療費明細の ID）
+**例外:** 仕訳が見つからない（404）、確定済み期間（400）、未解錠（`LockedError`）
+
+#### `list_medical_expenses`
+
+医療費明細の一覧を取得する。必要なスコープ: `journals:read`（要 MK 解錠）
+
+```python
+list_medical_expenses(*, fiscal_year: int | None = None) -> MedicalExpenseListResponse
+```
+
+| 引数 | 型 | 説明 |
+|------|-----|------|
+| `fiscal_year` | `int \| None` | 年度フィルタ（省略可、紐付く仕訳の年度で絞り込み） |
+
+取得した各明細は MK で復号されます。
+
+**戻り値:** `MedicalExpenseListResponse`（`expenses: list[MedicalExpense]`, `total: int`）
+
 #### `analyze`
 
 画像を AI 解析して下書きを作成する。必要なスコープ: `ai:analyze`

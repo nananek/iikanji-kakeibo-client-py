@@ -221,6 +221,97 @@ class JournalListResponse:
     per_page: int
 
 
+# --- 医療費 (MedicalExpense) ---
+
+
+@dataclass
+class MedicalExpense:
+    """医療費明細 (1 仕訳に 1 件)。
+
+    本体 (date/patient_name/hospital_name/treatment_description/provider_type/
+    amount_paid/insurance_reimbursement) は MK で暗号化して送受信する
+    (medical_expense_builder.js / medical_expenses_client.js と一致)。平文 wire
+    には journal_entry_id のみ載せる。
+    """
+
+    journal_entry_id: int
+    date: str | None = None
+    patient_name: str = ""
+    hospital_name: str = ""
+    treatment_description: str = ""
+    provider_type: str | None = None
+    amount_paid: int = 0
+    insurance_reimbursement: int = 0
+    id: int | None = None
+
+    def _record_body(self) -> dict:
+        """me record body (medical_expense_builder.js buildMedicalExpense と一致)。"""
+        return {
+            "v": 1,
+            "date": self.date or None,
+            "patient_name": self.patient_name or "",
+            "hospital_name": self.hospital_name or "",
+            "treatment_description": self.treatment_description or "",
+            "provider_type": self.provider_type or None,
+            "amount_paid": int(self.amount_paid or 0),
+            "insurance_reimbursement": int(self.insurance_reimbursement or 0),
+        }
+
+    def to_wire(self, mk: bytes, user_id: int) -> dict:
+        """暗号化済みの POST /api/v1/medical-expenses wire を生成する。"""
+        if int(self.amount_paid or 0) < 0 or int(self.insurance_reimbursement or 0) < 0:
+            raise ValueError("amount_paid / insurance_reimbursement は非負整数です。")
+        blob, iv = crypto.encrypt_record(
+            mk, self._record_body(), crypto.build_aad("me", user_id)
+        )
+        return {
+            "journal_entry_id": int(self.journal_entry_id),
+            "encrypted_blob": crypto.b64encode(blob),
+            "blob_iv": crypto.b64encode(iv),
+        }
+
+    @classmethod
+    def from_api(cls, d: dict, mk: bytes, user_id: int) -> MedicalExpense:
+        """API レスポンスの expense を復号して MedicalExpense に復元する。
+
+        id / journal_entry_id は平文メタを採用。本体は encrypted_blob (me) を
+        復号して取り出す。復号失敗時は各フィールドを既定値にフォールバックする
+        (medical_expenses_client.js _normalize と同方針)。
+        """
+        body: dict = {}
+        blob = d.get("encrypted_blob")
+        iv = d.get("blob_iv")
+        if blob and iv:
+            try:
+                body = crypto.decrypt_record(
+                    mk,
+                    crypto.b64decode(blob),
+                    crypto.b64decode(iv),
+                    crypto.build_aad("me", user_id),
+                )
+            except Exception:
+                body = {}
+        return cls(
+            journal_entry_id=d.get("journal_entry_id"),
+            date=body.get("date"),
+            patient_name=body.get("patient_name", ""),
+            hospital_name=body.get("hospital_name", ""),
+            treatment_description=body.get("treatment_description", ""),
+            provider_type=body.get("provider_type"),
+            amount_paid=int(body.get("amount_paid", 0) or 0),
+            insurance_reimbursement=int(body.get("insurance_reimbursement", 0) or 0),
+            id=d.get("id"),
+        )
+
+
+@dataclass
+class MedicalExpenseListResponse:
+    """医療費一覧レスポンス"""
+
+    expenses: list[MedicalExpense]
+    total: int
+
+
 # --- AI 証憑仕訳 ---
 
 
