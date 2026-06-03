@@ -1,4 +1,4 @@
-"""KakeiboClient のユニットテスト"""
+"""KakeiboClient のユニットテスト (E2EE: MK 解錠 + 暗号 wire)"""
 
 import json
 
@@ -17,7 +17,14 @@ from iikanji import (
     JournalListResponse,
     KakeiboAPIError,
     KakeiboClient,
+    LockedError,
+    crypto,
 )
+
+# 固定のテスト用 MK / user_id。E2EE では仕訳の暗号化/復号に必要。
+TEST_MK = bytes(range(32))  # 00..1f
+TEST_USER_ID = 42
+BASE_URL = "https://test.example.com"
 
 
 def _make_transport(status_code: int, body: dict) -> httpx.MockTransport:
@@ -27,31 +34,91 @@ def _make_transport(status_code: int, body: dict) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
-def _make_client(status_code: int, body: dict) -> KakeiboClient:
+def _make_client(
+    status_code: int, body: dict, *, unlocked: bool = True
+) -> KakeiboClient:
     transport = _make_transport(status_code, body)
     http_client = httpx.Client(
         transport=transport,
-        base_url="https://test.example.com",
+        base_url=BASE_URL,
         headers={"Authorization": "Bearer ik_testkey"},
     )
-    return KakeiboClient(
-        "https://test.example.com",
-        "ik_testkey",
-        http_client=http_client,
-    )
+    client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+    if unlocked:
+        _set_mk(client)
+    return client
 
 
-SAMPLE_JOURNAL = {
-    "id": 42,
-    "date": "2026-02-15",
-    "entry_number": 7,
-    "description": "テスト仕訳",
-    "source": "api",
-    "lines": [
-        {"account_code": "7010", "debit": 1000, "credit": 0, "description": ""},
-        {"account_code": "1010", "debit": 0, "credit": 1000, "description": "メモ"},
-    ],
-}
+def _set_mk(client: KakeiboClient) -> None:
+    """テスト用に MK を直接セット (unlock のサーバ往復を省く)。"""
+    client._mk = TEST_MK
+    client._user_id = TEST_USER_ID
+
+
+def _enc_entry_wire(
+    entry_id: int,
+    *,
+    date: str = "2026-02-15",
+    description: str = "テスト仕訳",
+    source: str = "api",
+    fiscal_period=None,
+    lines: list[dict] | None = None,
+    is_closing: bool = False,
+    encrypt: bool = True,
+) -> dict:
+    """API レスポンス相当の (暗号化済み) journal dict を生成する。"""
+    fiscal_year = int(date[:4])
+    fiscal_month = fiscal_period if fiscal_period is not None else int(date[5:7])
+    wire: dict = {
+        "id": entry_id,
+        "entry_number": 7,
+        "fiscal_year": fiscal_year,
+        "fiscal_month": fiscal_month,
+        "is_closing": is_closing,
+        "encrypted_blob": None,
+        "blob_iv": None,
+        "lines": [],
+        "vouchers": [],
+    }
+    if encrypt and not is_closing:
+        body = {
+            "v": 1,
+            "date": date,
+            "description": description,
+            "source": source,
+            "fiscal_period": fiscal_period,
+        }
+        blob, iv = crypto.encrypt_record(
+            TEST_MK, body, crypto.build_aad("je", TEST_USER_ID)
+        )
+        wire["encrypted_blob"] = crypto.b64encode(blob)
+        wire["blob_iv"] = crypto.b64encode(iv)
+    for ln in lines or []:
+        line_body = {
+            "v": 1,
+            "account_code": ln["account_code"],
+            "debit_amount": int(ln.get("debit", 0)),
+            "credit_amount": int(ln.get("credit", 0)),
+            "description": ln.get("description", ""),
+        }
+        lblob, liv = crypto.encrypt_record(
+            TEST_MK, line_body, crypto.build_aad("jel", TEST_USER_ID)
+        )
+        wire["lines"].append({
+            "id": ln.get("id", 1),
+            "account_code": ln["account_code"],
+            "debit": int(ln.get("debit", 0)),
+            "credit": int(ln.get("credit", 0)),
+            "encrypted_blob": crypto.b64encode(lblob),
+            "blob_iv": crypto.b64encode(liv),
+        })
+    return wire
+
+
+SAMPLE_LINES = [
+    {"account_code": "7010", "debit": 1000, "credit": 0, "description": ""},
+    {"account_code": "1010", "debit": 0, "credit": 1000, "description": "メモ"},
+]
 
 
 class TestCreateJournal:
@@ -72,7 +139,17 @@ class TestCreateJournal:
         assert result.id == 42
         assert result.entry_number == 7
 
-    def test_sends_correct_payload(self) -> None:
+    def test_requires_unlock(self) -> None:
+        """MK 未解錠だと LockedError (サーバに送信しない)。"""
+        client = _make_client(201, {"ok": True, "id": 1, "entry_number": 1}, unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.create_journal(
+                date="2026-02-15",
+                description="x",
+                lines=[JournalLine(account_code="1010", debit=100)],
+            )
+
+    def test_sends_encrypted_payload(self) -> None:
         captured: list[dict] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -81,11 +158,13 @@ class TestCreateJournal:
 
         http_client = httpx.Client(
             transport=httpx.MockTransport(handler),
-            base_url="https://test.example.com",
+            base_url=BASE_URL,
             headers={"Authorization": "Bearer ik_testkey"},
         )
 
-        with KakeiboClient("https://test.example.com", "ik_testkey", http_client=http_client) as client:
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        _set_mk(client)
+        with client:
             client.create_journal(
                 date="2026-01-10",
                 description="食材",
@@ -97,12 +176,57 @@ class TestCreateJournal:
             )
 
         payload = captured[0]
-        assert payload["date"] == "2026-01-10"
-        assert payload["description"] == "食材"
-        assert payload["source"] == "custom"
+        # 平文メタは fiscal_year / fiscal_month のみ。date/description/source は wire に無い
+        assert payload["fiscal_year"] == 2026
+        assert payload["fiscal_month"] == 1
+        assert "date" not in payload and "description" not in payload and "source" not in payload
+        assert "encrypted_blob" in payload and "blob_iv" in payload
+        # entry blob を復号すると元の値が取れる
+        body = crypto.decrypt_record(
+            TEST_MK,
+            crypto.b64decode(payload["encrypted_blob"]),
+            crypto.b64decode(payload["blob_iv"]),
+            crypto.build_aad("je", TEST_USER_ID),
+        )
+        assert body["date"] == "2026-01-10"
+        assert body["description"] == "食材"
+        assert body["source"] == "custom"
+        # line: 平文は account_code/debit/credit のみ、description は暗号化
         assert len(payload["lines"]) == 2
-        assert payload["lines"][0] == {"account_code": "7010", "debit": 500, "description": "メモ"}
-        assert payload["lines"][1] == {"account_code": "1010", "credit": 500}
+        line0 = payload["lines"][0]
+        assert line0["account_code"] == "7010" and line0["debit"] == 500
+        assert "description" not in line0
+        lbody = crypto.decrypt_record(
+            TEST_MK,
+            crypto.b64decode(line0["encrypted_blob"]),
+            crypto.b64decode(line0["blob_iv"]),
+            crypto.build_aad("jel", TEST_USER_ID),
+        )
+        assert lbody["description"] == "メモ"
+        assert lbody["debit_amount"] == 500
+
+    def test_fiscal_period_overrides_month(self) -> None:
+        captured: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(201, json={"ok": True, "id": 1, "entry_number": 1})
+
+        http_client = httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url=BASE_URL,
+            headers={"Authorization": "Bearer ik_testkey"},
+        )
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        _set_mk(client)
+        with client:
+            client.create_journal(
+                date="2026-05-10",
+                description="期首",
+                lines=[JournalLine(account_code="1010", debit=1), JournalLine(account_code="1020", credit=1)],
+                fiscal_period=0,
+            )
+        assert captured[0]["fiscal_month"] == 0
 
     def test_with_draft_id(self) -> None:
         captured: list[dict] = []
@@ -113,11 +237,13 @@ class TestCreateJournal:
 
         http_client = httpx.Client(
             transport=httpx.MockTransport(handler),
-            base_url="https://test.example.com",
+            base_url=BASE_URL,
             headers={"Authorization": "Bearer ik_testkey"},
         )
 
-        with KakeiboClient("https://test.example.com", "ik_testkey", http_client=http_client) as client:
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        _set_mk(client)
+        with client:
             client.create_journal(
                 date="2026-01-10",
                 description="下書きから確定",
@@ -139,11 +265,13 @@ class TestCreateJournal:
 
         http_client = httpx.Client(
             transport=httpx.MockTransport(handler),
-            base_url="https://test.example.com",
+            base_url=BASE_URL,
             headers={"Authorization": "Bearer ik_testkey"},
         )
 
-        with KakeiboClient("https://test.example.com", "ik_testkey", http_client=http_client) as client:
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        _set_mk(client)
+        with client:
             client.create_journal(
                 date="2026-01-10",
                 description="通常の仕訳",
@@ -201,18 +329,20 @@ class TestCreateJournal:
 
         http_client = httpx.Client(
             transport=httpx.MockTransport(handler),
-            base_url="https://test.example.com",
+            base_url=BASE_URL,
             headers={"Authorization": "Bearer ik_testkey"},
         )
 
-        with KakeiboClient("https://test.example.com", "ik_testkey", http_client=http_client) as client:
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        _set_mk(client)
+        with client:
             client.create_journal(
                 date=date(2026, 3, 1),
                 description="date objectテスト",
                 lines=[JournalLine(account_code="1010", debit=100), JournalLine(account_code="1020", credit=100)],
             )
 
-        assert captured[0]["date"] == "2026-03-01"
+        assert captured[0]["fiscal_year"] == 2026 and captured[0]["fiscal_month"] == 3
 
     def test_datetime_object(self) -> None:
         from datetime import datetime
@@ -225,23 +355,26 @@ class TestCreateJournal:
 
         http_client = httpx.Client(
             transport=httpx.MockTransport(handler),
-            base_url="https://test.example.com",
+            base_url=BASE_URL,
             headers={"Authorization": "Bearer ik_testkey"},
         )
 
-        with KakeiboClient("https://test.example.com", "ik_testkey", http_client=http_client) as client:
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        _set_mk(client)
+        with client:
             client.create_journal(
                 date=datetime(2026, 3, 1, 14, 30, 0),
                 description="datetimeテスト",
                 lines=[JournalLine(account_code="1010", debit=100), JournalLine(account_code="1020", credit=100)],
             )
 
-        assert captured[0]["date"] == "2026-03-01"
+        assert captured[0]["fiscal_month"] == 3
 
 
 class TestGetJournal:
     def test_success(self) -> None:
-        client = _make_client(200, {"ok": True, "journal": SAMPLE_JOURNAL})
+        journal = _enc_entry_wire(42, lines=SAMPLE_LINES)
+        client = _make_client(200, {"ok": True, "journal": journal})
 
         with client:
             result = client.get_journal(42)
@@ -256,6 +389,22 @@ class TestGetJournal:
         assert result.lines[0].account_code == "7010"
         assert result.lines[0].debit == 1000
         assert result.lines[1].description == "メモ"
+
+    def test_requires_unlock(self) -> None:
+        client = _make_client(200, {"ok": True, "journal": {}}, unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.get_journal(42)
+
+    def test_closing_entry_synthesized(self) -> None:
+        """closing 仕訳 (encrypted_blob=None) は fiscal_year から合成する。"""
+        journal = _enc_entry_wire(99, is_closing=True, date="2026-01-01")
+        client = _make_client(200, {"ok": True, "journal": journal})
+        with client:
+            result = client.get_journal(99)
+        assert result.is_closing is True
+        assert result.date == "2026-12-31"
+        assert result.source == "closing"
+        assert "損益振替" in result.description
 
     def test_not_found(self) -> None:
         client = _make_client(404, {"error": "仕訳が見つかりません。"})
@@ -278,7 +427,7 @@ class TestListJournals:
     def test_success(self) -> None:
         body = {
             "ok": True,
-            "journals": [SAMPLE_JOURNAL],
+            "journals": [_enc_entry_wire(42, lines=SAMPLE_LINES)],
             "total": 1,
             "page": 1,
             "per_page": 20,
@@ -294,6 +443,12 @@ class TestListJournals:
         assert result.per_page == 20
         assert len(result.journals) == 1
         assert result.journals[0].id == 42
+        assert result.journals[0].description == "テスト仕訳"
+
+    def test_requires_unlock(self) -> None:
+        client = _make_client(200, {"ok": True, "journals": [], "total": 0, "page": 1, "per_page": 20}, unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.list_journals()
 
     def test_sends_query_params(self) -> None:
         captured_urls: list[str] = []
@@ -306,18 +461,110 @@ class TestListJournals:
 
         http_client = httpx.Client(
             transport=httpx.MockTransport(handler),
-            base_url="https://test.example.com",
+            base_url=BASE_URL,
             headers={"Authorization": "Bearer ik_testkey"},
         )
 
-        with KakeiboClient("https://test.example.com", "ik_testkey", http_client=http_client) as client:
-            client.list_journals(date_from="2026-01-01", date_to="2026-01-31", page=2, per_page=10)
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        _set_mk(client)
+        with client:
+            client.list_journals(fiscal_year=2026, page=2, per_page=10)
 
         url = captured_urls[0]
-        assert "date_from=2026-01-01" in url
-        assert "date_to=2026-01-31" in url
+        assert "fiscal_year=2026" in url
         assert "page=2" in url
         assert "per_page=10" in url
+
+
+def _wrapped_keys_body() -> dict:
+    """GET /api/v1/wrapped-keys のモックレスポンス (passphrase 方式)。
+
+    GOLDEN_* と同じ固定入力で MK を導出できる wrapped_master_key を返す。
+    """
+    from tests.test_crypto import (
+        GOLDEN_KDF_PARAMS,
+        GOLDEN_SALT,
+        GOLDEN_WRAP_IV,
+        GOLDEN_WRAPPED_MK,
+    )
+
+    return {
+        "user_id": 99,
+        "wrapped_keys": [
+            {
+                "id": 1,
+                "method": "passphrase",
+                "wrapped_master_key": crypto.b64encode(GOLDEN_WRAPPED_MK),
+                "wrap_iv": crypto.b64encode(GOLDEN_WRAP_IV),
+                "salt": crypto.b64encode(GOLDEN_SALT),
+                "kdf_params": GOLDEN_KDF_PARAMS,
+            }
+        ],
+    }
+
+
+class TestUnlock:
+    def test_unlock_derives_and_persists(self) -> None:
+        from tests.test_crypto import GOLDEN_MK_HEX, GOLDEN_PASSPHRASE
+
+        client = _make_client(200, _wrapped_keys_body(), unlocked=False)
+        assert client.is_unlocked is False
+        with client:
+            client.unlock(GOLDEN_PASSPHRASE)
+            assert client.is_unlocked is True
+            assert client._mk.hex() == GOLDEN_MK_HEX
+            assert client._user_id == 99
+            # keyring に永続化されている
+            assert crypto.load_mk(BASE_URL) == (99, client._mk)
+
+    def test_wrong_passphrase_raises(self) -> None:
+        client = _make_client(200, _wrapped_keys_body(), unlocked=False)
+        with client, pytest.raises(KakeiboAPIError) as exc_info:
+            client.unlock("wrong passphrase")
+        assert "パスフレーズ" in exc_info.value.message
+        assert client.is_unlocked is False
+
+    def test_no_passphrase_method_raises(self) -> None:
+        body = {"user_id": 99, "wrapped_keys": [{"id": 1, "method": "passkey_prf"}]}
+        client = _make_client(200, body, unlocked=False)
+        with client, pytest.raises(KakeiboAPIError) as exc_info:
+            client.unlock("x")
+        assert "passphrase" in exc_info.value.message
+
+    def test_lock_clears_state(self) -> None:
+        from tests.test_crypto import GOLDEN_PASSPHRASE
+
+        client = _make_client(200, _wrapped_keys_body(), unlocked=False)
+        with client:
+            client.unlock(GOLDEN_PASSPHRASE)
+            assert client.is_unlocked is True
+            client.lock()
+            assert client.is_unlocked is False
+            assert crypto.load_mk(BASE_URL) is None
+
+
+class TestClientInit:
+    def test_restores_mk_from_keyring(self) -> None:
+        mk = bytes(range(32))
+        crypto.store_mk(BASE_URL, 77, mk)
+        http_client = httpx.Client(
+            transport=_make_transport(200, {"ok": True}),
+            base_url=BASE_URL,
+            headers={"Authorization": "Bearer ik_testkey"},
+        )
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        assert client.is_unlocked is True
+        assert client._user_id == 77
+        assert client._mk == mk
+
+    def test_starts_locked_without_keyring(self) -> None:
+        http_client = httpx.Client(
+            transport=_make_transport(200, {"ok": True}),
+            base_url=BASE_URL,
+            headers={"Authorization": "Bearer ik_testkey"},
+        )
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        assert client.is_unlocked is False
 
 
 class TestDeleteJournal:

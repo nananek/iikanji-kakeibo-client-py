@@ -1,7 +1,8 @@
 """いいかんじ家計簿 Python クライアント"""
 
+from . import crypto
 from .client import KakeiboClient
-from .exceptions import AuthenticationError, KakeiboAPIError
+from .exceptions import AuthenticationError, KakeiboAPIError, LockedError
 from .models import (
     AnalyzeResponse,
     DraftDetail,
@@ -27,4 +28,6 @@ __all__ = [
     "DraftSummary",
     "KakeiboAPIError",
     "AuthenticationError",
+    "LockedError",
+    "crypto",
 ]

@@ -1,9 +1,19 @@
-"""いいかんじ家計簿 API データモデル"""
+"""いいかんじ家計簿 API データモデル
+
+E2EE (Phase E6 §15.1): 仕訳本体 (date/description/source/fiscal_period) と各
+明細行 (account_code/debit/credit/description のうち description) は MK で
+AES-GCM 暗号化して ``encrypted_blob`` / ``blob_iv`` (base64) で送受信する。
+平文 wire には ``fiscal_year`` / ``fiscal_month`` と集計用の line
+``account_code`` / ``debit`` / ``credit`` のみ載せる
+(server/app/static/js/crypto/entries_builder.js と一致)。
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
+
+from . import crypto
 
 
 @dataclass
@@ -15,15 +25,61 @@ class JournalLine:
     credit: int = 0
     description: str = ""
 
-    def to_dict(self) -> dict:
-        d: dict = {"account_code": self.account_code}
-        if self.debit:
-            d["debit"] = self.debit
-        if self.credit:
-            d["credit"] = self.credit
-        if self.description:
-            d["description"] = self.description
-        return d
+    def _record_body(self) -> dict:
+        """jel record body (entries_builder.js _encryptEntry と一致)。"""
+        return {
+            "v": 1,
+            "account_code": self.account_code,
+            "debit_amount": int(self.debit or 0),
+            "credit_amount": int(self.credit or 0),
+            "description": self.description or "",
+        }
+
+    def to_wire(self, mk: bytes, user_id: int) -> dict:
+        """暗号化 line wire を生成する。
+
+        平文メタは account_code / debit / credit (集計用)。description は
+        encrypted_blob (jel) にのみ格納する。
+        """
+        blob, iv = crypto.encrypt_record(
+            mk, self._record_body(), crypto.build_aad("jel", user_id)
+        )
+        return {
+            "account_code": self.account_code,
+            "debit": int(self.debit or 0),
+            "credit": int(self.credit or 0),
+            "encrypted_blob": crypto.b64encode(blob),
+            "blob_iv": crypto.b64encode(iv),
+        }
+
+    @classmethod
+    def from_api(cls, line: dict, mk: bytes, user_id: int) -> JournalLine:
+        """API レスポンスの line を復号して JournalLine に復元する。
+
+        account_code / debit / credit は平文メタを採用。description は
+        encrypted_blob (jel) を復号して取り出す。復号失敗時は description を
+        空にフォールバック (journals_client.js _normalizeLine と同方針)。
+        """
+        description = ""
+        blob = line.get("encrypted_blob")
+        iv = line.get("blob_iv")
+        if blob and iv:
+            try:
+                body = crypto.decrypt_record(
+                    mk,
+                    crypto.b64decode(blob),
+                    crypto.b64decode(iv),
+                    crypto.build_aad("jel", user_id),
+                )
+                description = body.get("description", "")
+            except Exception:
+                description = ""
+        return cls(
+            account_code=line.get("account_code"),
+            debit=int(line.get("debit", 0) or 0),
+            credit=int(line.get("credit", 0) or 0),
+            description=description,
+        )
 
 
 @dataclass
@@ -34,21 +90,47 @@ class JournalCreateRequest:
     description: str
     lines: list[JournalLine]
     source: str = "api"
+    fiscal_period: int | None = None
 
     draft_id: int | None = None
 
-    def to_dict(self) -> dict:
+    def _date_str(self) -> str:
         if isinstance(self.date, str):
-            d = self.date
-        elif isinstance(self.date, datetime):
-            d = self.date.date().isoformat()
-        else:
-            d = self.date.isoformat()
-        result = {
+            return self.date
+        if isinstance(self.date, datetime):
+            return self.date.date().isoformat()
+        return self.date.isoformat()
+
+    def to_wire(self, mk: bytes, user_id: int) -> dict:
+        """暗号化済みの POST /api/v1/journals wire を生成する。
+
+        entry 本体 (date/description/source/fiscal_period) を ``je`` record で
+        暗号化し、平文メタ fiscal_year / fiscal_month を算出して付与する
+        (entries_builder.js _encryptEntry と一致)。
+        """
+        d = self._date_str()
+        fiscal_year = int(d[:4])
+        fiscal_month = (
+            self.fiscal_period
+            if self.fiscal_period is not None
+            else int(d[5:7])
+        )
+        entry_body = {
+            "v": 1,
             "date": d,
             "description": self.description,
-            "lines": [line.to_dict() for line in self.lines],
             "source": self.source,
+            "fiscal_period": self.fiscal_period,
+        }
+        blob, iv = crypto.encrypt_record(
+            mk, entry_body, crypto.build_aad("je", user_id)
+        )
+        result: dict = {
+            "fiscal_year": fiscal_year,
+            "fiscal_month": fiscal_month,
+            "encrypted_blob": crypto.b64encode(blob),
+            "blob_iv": crypto.b64encode(iv),
+            "lines": [line.to_wire(mk, user_id) for line in self.lines],
         }
         if self.draft_id is not None:
             result["draft_id"] = self.draft_id
@@ -73,24 +155,59 @@ class JournalDetail:
     description: str
     source: str
     lines: list[JournalLine]
+    fiscal_year: int | None = None
+    fiscal_month: int | None = None
+    is_closing: bool = False
 
     @classmethod
-    def from_dict(cls, data: dict) -> JournalDetail:
+    def from_dict(cls, data: dict, mk: bytes, user_id: int) -> JournalDetail:
+        """API レスポンスの journal を復号して JournalDetail に復元する。
+
+        通常仕訳は ``je`` blob を復号して date/description/source を得る。
+        closing 仕訳 (is_closing=True, encrypted_blob=None) は fiscal_year から
+        合成する (journals_client.js decryptEntryMeta と一致)。
+        """
+        fiscal_year = data.get("fiscal_year")
+        is_closing = bool(data.get("is_closing", False))
+        date_val: str | None = None
+        description = ""
+        source = ""
+
+        blob = data.get("encrypted_blob")
+        iv = data.get("blob_iv")
+        if blob and iv:
+            try:
+                body = crypto.decrypt_record(
+                    mk,
+                    crypto.b64decode(blob),
+                    crypto.b64decode(iv),
+                    crypto.build_aad("je", user_id),
+                )
+                date_val = body.get("date")
+                description = body.get("description", "")
+                source = body.get("source", "")
+            except Exception:
+                # 復号失敗は局所化 (closing 以外は date=None / 空のままにする)
+                pass
+
+        if date_val is None and is_closing and fiscal_year is not None:
+            date_val = f"{fiscal_year}-12-31"
+            description = description or "損益振替仕訳（自動生成）"
+            source = source or "closing"
+
         return cls(
             id=data["id"],
-            date=data["date"],
-            entry_number=data["entry_number"],
-            description=data["description"],
-            source=data["source"],
+            date=date_val,
+            entry_number=data.get("entry_number"),
+            description=description,
+            source=source,
             lines=[
-                JournalLine(
-                    account_code=line["account_code"],
-                    debit=line.get("debit", 0),
-                    credit=line.get("credit", 0),
-                    description=line.get("description", ""),
-                )
-                for line in data["lines"]
+                JournalLine.from_api(line, mk, user_id)
+                for line in data.get("lines", [])
             ],
+            fiscal_year=fiscal_year,
+            fiscal_month=data.get("fiscal_month"),
+            is_closing=is_closing,
         )
 
 

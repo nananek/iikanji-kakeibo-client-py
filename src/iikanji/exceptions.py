@@ -15,3 +15,16 @@ class AuthenticationError(KakeiboAPIError):
 
     def __init__(self, message: str = "無効な API キーです。") -> None:
         super().__init__(401, message)
+
+
+class LockedError(KakeiboAPIError):
+    """MK (マスターキー) が未解錠の状態で暗号化が必要な操作を呼んだ場合の例外。
+
+    E2EE: 仕訳の作成・取得は MK を要する。``KakeiboClient.unlock(passphrase)``
+    で解錠してから呼ぶこと。
+    """
+
+    def __init__(
+        self, message: str = "MK が未解錠です。unlock(passphrase) を先に呼んでください。"
+    ) -> None:
+        super().__init__(0, message)
