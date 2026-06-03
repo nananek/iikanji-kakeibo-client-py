@@ -521,17 +521,26 @@ list_audit_responses() -> list[dict]
 acknowledge_audit_response(response_id: int) -> dict
 ```
 
-#### `build_lv3_snapshot` / `send_lv3_snapshot`
+#### スナップショット構築（Lv1 / Lv2 / Lv3）
 
-Lv3（本人同等）スナップショットを構築 / 構築から送信まで一括。要 MK。全台帳を復号し
-証憑画像を inline base64 で同梱します（設定系は除外）。
+要 MK。スナップショットを構築 / 構築から送信まで一括で行います。
+
+- **Lv1**（集計のみ）: 試算表 / P/L / B/S / 月次比較。仕訳本体は含めません。
+- **Lv2**（税務科目限定）: Lv1 + 税務科目を含む仕訳のみ + 税務集計（owner 側で強制フィルタ）。
+- **Lv3**（本人同等）: 全台帳を復号し証憑画像を inline base64 で同梱（設定系は除外）。
+
+集計（試算表 / P/L / B/S / 月次比較 / 税務集計）は `iikanji.reports` の純粋関数で、
+Web の `crypto/reports/*.js` と出力構造が一致します。
 
 ```python
+build_lv1_snapshot(fiscal_year: int) -> dict
+build_lv2_snapshot(fiscal_year: int) -> dict
 build_lv3_snapshot() -> dict
+# 構築 + 送信を一括。Lv1/Lv2 は fiscal_year 必須
+send_snapshot(*, audit_grant_id: int, round_id: int, auditor_user_id: int,
+              level: int, fiscal_year: int | None = None) -> dict
 send_lv3_snapshot(*, audit_grant_id: int, round_id: int, auditor_user_id: int) -> dict
 ```
-
-> Lv1（集計のみ）/ Lv2（税務科目 + 集計）スナップショットの生成は未対応です（後続）。
 
 #### `close`
 

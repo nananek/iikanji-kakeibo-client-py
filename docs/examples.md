@@ -406,6 +406,19 @@ with KakeiboClient("https://example.com", "ik_owner_key") as owner:
         owner.acknowledge_audit_response(resp["id"])
 ```
 
+上の例は Lv3（本人同等）の送信です。Lv1（集計のみ）/ Lv2（税務科目 + 集計）は
+`send_snapshot(..., level=1, fiscal_year=2026)` のように送れます。
+
+```python
+with KakeiboClient("https://example.com", "ik_owner_key") as owner:
+    owner.unlock("ownerのパスフレーズ")
+    owner.ensure_keypair()
+    owner.send_snapshot(audit_grant_id=1, round_id=1, auditor_user_id=8,
+                        level=1, fiscal_year=2026)   # Lv1 集計のみ
+    owner.send_snapshot(audit_grant_id=2, round_id=1, auditor_user_id=9,
+                        level=2, fiscal_year=2026)   # Lv2 税務科目限定
+```
+
 スナップショットの暗号化は suite = DHKEM-X25519-HKDF-SHA256 / HKDF-SHA256 / AES-256-GCM
-（RFC 9180）で、Web の `@hpke/core` と相互運用できます。Lv1 / Lv2（集計スナップショット）は
-未対応です。
+（RFC 9180）で、Web の `@hpke/core` と相互運用できます。集計（試算表 / P/L / B/S / 月次 /
+税務集計）は Web の `crypto/reports/*.js` と出力構造が一致します。

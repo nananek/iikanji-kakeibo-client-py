@@ -10,7 +10,7 @@ import httpx
 import json
 
 from . import backup as backup_mod
-from . import crypto, hpke, thumbnail
+from . import crypto, hpke, reports, thumbnail
 from .exceptions import AuthenticationError, KakeiboAPIError, LockedError
 from pathlib import Path
 
@@ -1405,23 +1405,173 @@ class KakeiboClient:
                 out.append({**base, "_imageError": True})
         return out
 
-    def send_lv3_snapshot(
-        self, *, audit_grant_id: int, round_id: int, auditor_user_id: int
-    ) -> dict:
-        """Lv3 スナップショットを構築し監査者宛に HPKE 暗号化して送信する。要 MK。
+    def _accounts_meta(self) -> dict:
+        """``code → {type, normal_balance, name, tax_category}`` を構築する。"""
+        return {
+            a.code: {
+                "type": a.account_type,
+                "normal_balance": a.normal_balance,
+                "name": a.name,
+                "tax_category": a.tax_category,
+            }
+            for a in self.list_accounts()
+        }
 
-        :meth:`build_lv3_snapshot` → :meth:`get_peer_public_key` →
-        :meth:`send_audit_package` (permission_level=3) を一括で行う便利メソッド。
+    @staticmethod
+    def _entry_to_report_dict(jd) -> dict:
+        """JournalDetail を reports / スナップショット用の正規化 entry dict に変換。"""
+        return {
+            "id": jd.id,
+            "entry_number": jd.entry_number,
+            "fiscal_year": jd.fiscal_year,
+            "date": jd.date,
+            "description": jd.description,
+            "source": jd.source,
+            "is_closing": jd.is_closing,
+            "fiscal_month": jd.fiscal_month,
+            "lines": [
+                {
+                    "account_code": line.account_code,
+                    "debit": line.debit,
+                    "credit": line.credit,
+                    "description": line.description,
+                }
+                for line in jd.lines
+            ],
+        }
+
+    def _year_reports(self, fiscal_year: int, accounts_meta: dict) -> dict:
+        """指定年度の仕訳を復号し、試算表 / P/L / B/S / 月次比較を計算する。
+
+        B/S は前年末 (year-1, period=15) の残高キャッシュを priorCumulative に流す
+        (audit_snapshot.js: _yearReports と同方針)。BCB 欠落時は ``{}`` で degraded。
         """
-        snapshot = self.build_lv3_snapshot()
+        entries = [
+            self._entry_to_report_dict(jd)
+            for jd in self._iter_all_journals(fiscal_year)
+        ]
+        type_by = {c: m["type"] for c, m in accounts_meta.items()}
+        nb_by = {c: m["normal_balance"] for c, m in accounts_meta.items()}
+        name_by = {c: m["name"] for c, m in accounts_meta.items()}
+        try:
+            prior = self.list_balance_cache_blobs(fiscal_year - 1).get(15, {})
+        except Exception:
+            prior = {}
+        return {
+            "entries": entries,
+            "trial_balance": reports.compute_trial_balance(entries),
+            "profit_loss": reports.compute_profit_loss(
+                entries, account_type_by_code=type_by, account_name_by_code=name_by
+            ),
+            "balance_sheet": reports.compute_balance_sheet(
+                entries, account_type_by_code=type_by,
+                normal_balance_by_code=nb_by, account_name_by_code=name_by,
+                prior_cumulative=prior,
+            ),
+            "monthly": reports.compute_monthly_comparison(
+                entries, account_type_by_code=type_by, account_name_by_code=name_by
+            ),
+        }
+
+    def build_lv1_snapshot(self, fiscal_year: int) -> dict:
+        """Lv1 (集計のみ) 監査スナップショットを構築する。要 MK 解錠。
+
+        必要なスコープ: ``journals:read``。試算表 / P/L / B/S / 月次比較のみで、
+        仕訳本体は含めません (audit_snapshot.js: buildSnapshotLv1 相当)。
+        """
+        self._require_mk()
+        accounts_meta = self._accounts_meta()
+        r = self._year_reports(fiscal_year, accounts_meta)
+        return {
+            "v": 1,
+            "level": 1,
+            "fiscal_year": fiscal_year,
+            "accounts_meta": accounts_meta,
+            "trial_balance": r["trial_balance"],
+            "profit_loss": r["profit_loss"],
+            "balance_sheet": r["balance_sheet"],
+            "monthly": r["monthly"],
+        }
+
+    def build_lv2_snapshot(self, fiscal_year: int) -> dict:
+        """Lv2 (税務科目限定) 監査スナップショットを構築する。要 MK 解錠。
+
+        必要なスコープ: ``journals:read``。Lv1 + 税務科目 (tax_category 付き) を含む
+        仕訳のみ + 税務集計。フィルタは owner 側で強制します (§14.5、E2EE と矛盾なし)。
+        """
+        self._require_mk()
+        accounts_meta = self._accounts_meta()
+        tax_by = {c: m["tax_category"] for c, m in accounts_meta.items()}
+        name_by = {c: m["name"] for c, m in accounts_meta.items()}
+        r = self._year_reports(fiscal_year, accounts_meta)
+        tax_entries = [
+            e for e in r["entries"]
+            if any(
+                line.get("account_code") is not None
+                and tax_by.get(line.get("account_code")) is not None
+                for line in (e.get("lines") or [])
+            )
+        ]
+        return {
+            "v": 1,
+            "level": 2,
+            "fiscal_year": fiscal_year,
+            "accounts_meta": accounts_meta,
+            "trial_balance": r["trial_balance"],
+            "profit_loss": r["profit_loss"],
+            "balance_sheet": r["balance_sheet"],
+            "monthly": r["monthly"],
+            "tax_summary": reports.compute_tax_summary(
+                r["entries"], tax_category_by_code=tax_by,
+                account_name_by_code=name_by,
+            ),
+            "entries": tax_entries,
+        }
+
+    def send_snapshot(
+        self,
+        *,
+        audit_grant_id: int,
+        round_id: int,
+        auditor_user_id: int,
+        level: int,
+        fiscal_year: int | None = None,
+    ) -> dict:
+        """指定レベルのスナップショットを構築し監査者宛に HPKE 暗号化して送信する。要 MK。
+
+        ``build_lv{level}_snapshot`` → :meth:`get_peer_public_key` →
+        :meth:`send_audit_package` (permission_level=level) を一括で行う。Lv1/Lv2 は
+        ``fiscal_year`` が必須です。
+        """
+        if level == 1:
+            if fiscal_year is None:
+                raise ValueError("Lv1 スナップショットには fiscal_year が必要です。")
+            snapshot = self.build_lv1_snapshot(fiscal_year)
+        elif level == 2:
+            if fiscal_year is None:
+                raise ValueError("Lv2 スナップショットには fiscal_year が必要です。")
+            snapshot = self.build_lv2_snapshot(fiscal_year)
+        elif level == 3:
+            snapshot = self.build_lv3_snapshot()
+        else:
+            raise ValueError(f"level must be 1, 2, or 3: {level}")
         plaintext = json.dumps(snapshot, ensure_ascii=False).encode("utf-8")
         recipient = self.get_peer_public_key(auditor_user_id)
         return self.send_audit_package(
             audit_grant_id=audit_grant_id,
             round_id=round_id,
-            permission_level=3,
+            permission_level=level,
             recipient_public_key=recipient,
             plaintext=plaintext,
+        )
+
+    def send_lv3_snapshot(
+        self, *, audit_grant_id: int, round_id: int, auditor_user_id: int
+    ) -> dict:
+        """Lv3 スナップショットを構築し監査者宛に送信する (:meth:`send_snapshot` の薄い別名)。"""
+        return self.send_snapshot(
+            audit_grant_id=audit_grant_id, round_id=round_id,
+            auditor_user_id=auditor_user_id, level=3,
         )
 
     # --- 内部ヘルパー ---
