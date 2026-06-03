@@ -259,13 +259,18 @@ trial_balance(*, fiscal_year: int, include_closing: bool = False) -> TrialBalanc
 
 画像を AI 解析して下書きを作成する。必要なスコープ: `ai:analyze`
 
+クライアント完結フロー（画像と LLM API キーはサーバーを経由せず、このプロセスから
+直接 LLM へ送信）。LLM API キーは `KakeiboClient(..., openai_api_key=/anthropic_api_key=
+/google_api_key=...)` で渡します。
+
 ```python
 analyze(
     image: str | Path | bytes,
     *,
     comment: str = "",
-    notify: bool = False,
     mime_type: str | None = None,
+    provider: str = "openai",
+    model: str | None = None,
 ) -> AnalyzeResponse
 ```
 
@@ -273,8 +278,14 @@ analyze(
 |------|-----|------|
 | `image` | `str \| Path \| bytes` | 画像ファイルパスまたはバイト列 |
 | `comment` | `str` | メモ（省略可、最大500文字） |
-| `notify` | `bool` | True で Webhook 通知を送信 |
 | `mime_type` | `str \| None` | バイト列渡し時の MIME タイプ（デフォルト: `image/jpeg`） |
+| `provider` | `str` | `"openai"` / `"anthropic"` / `"google"`（デフォルト openai） |
+| `model` | `str \| None` | 使用モデル名（省略時はサーバーの provider 別デフォルト） |
+
+**元帳コンテキスト（E2EE）:** Round 1 で AI が元帳参照を要求した場合（`needs_ledger`）、
+E2EE のためサーバーは元帳を生成できないので、**MK が解錠済みなら**該当年度の仕訳を
+復号して元帳コンテキストをクライアント側で構築し Round 2 に渡します。MK 未解錠時は
+元帳なしで続行します（解析自体は MK 不要）。
 
 **戻り値:** `AnalyzeResponse`
 
