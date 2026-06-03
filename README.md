@@ -3,7 +3,7 @@
 いいかんじ家計簿サーバーの API を Python から呼び出すためのクライアントライブラリです。
 仕訳の起票・閲覧・削除、AI 証憑仕訳（画像解析・下書き管理）、証憑画像の E2EE
 保存（アップロード・取得・サムネ生成）、全データバックアップ / リストア（`.ikbackup`
-パスフレーズアーカイブ）に対応しています。
+パスフレーズアーカイブ）、`iikanji export` CLI（CSV + 画像 zip）に対応しています。
 
 ## E2EE（エンドツーエンド暗号化）について
 
@@ -100,6 +100,25 @@ with KakeiboClient("https://your-server.example.com", "ik_your_api_key") as clie
 画像・サムネ・メタはクライアントで暗号化され、サーバーには暗号文しか渡りません。`aad_id`
 は画像の再取得・復号に必須なので保存しておいてください（backup/restore で `voucher_id` が
 再採番されても `aad_id` は保持されます）。
+
+### `iikanji export` コマンド（CSV + 画像 zip）
+
+全データを人間可読な CSV と証憑画像、機械可読な `backup.json` を含む zip にエクスポート
+します。インストールすると `iikanji` コマンドが使えます。
+
+```bash
+iikanji export \
+    --base-url https://your-server.example.com \
+    --api-key ik_your_api_key \
+    --passphrase 'あなたのパスフレーズ' \
+    -o backup.zip
+```
+
+`--base-url` / `--api-key` / `--passphrase` は環境変数 `IIKANJI_BASE_URL` /
+`IIKANJI_API_KEY` / `IIKANJI_PASSPHRASE` でも指定できます。MK が OS キーリングに
+保存済みなら `--passphrase` は省略できます。zip には `journal.csv`・`accounts.csv`・
+`medical.csv`・`vouchers.csv`（UTF-8 BOM）、復号済みの証憑画像（`vouchers/`）、
+`backup.json`（暗号文のまま、リストア用）、`README.txt` が含まれます。
 
 API キーはサーバーの **設定 > API キー管理** から発行できます。必要なスコープ（`journals:create`, `journals:read`, `journals:delete`, `ai:analyze`）を選択してください。
 

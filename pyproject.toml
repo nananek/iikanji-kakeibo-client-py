@@ -13,6 +13,9 @@ dependencies = [
     "Pillow>=10",
 ]
 
+[project.scripts]
+iikanji = "iikanji.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",

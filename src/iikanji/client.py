@@ -1052,16 +1052,41 @@ class KakeiboClient:
             return resp.json()
         self._raise_for_error(resp)
 
-    def export_backup_decrypted(self) -> dict:
+    def export_backup_decrypted(self, raw: dict | None = None) -> dict:
         """全データバックアップを取得し MK で復号して平文 dict にする。要 MK 解錠。
 
         必要なスコープ: ``journals:read``。je/jel/me/bcb の暗号文を復号して各行に
         展開します (復号できない行は ``_decryptError`` を付与)。**この形式は復元には
         使えません** (暗号文が落ちるため)。復元用は :meth:`export_backup` を使います。
+
+        Args:
+            raw: 既に取得済みの :meth:`export_backup` レスポンス。指定すると再取得
+                せずにそれを復号する (レート制限の節約)。省略時は GET する。
         """
         mk, user_id = self._require_mk()
-        raw = self.export_backup()
+        if raw is None:
+            raw = self.export_backup()
         return backup_mod.decrypt_backup(mk, user_id, raw)
+
+    def decrypt_voucher_image_blob(
+        self, blob: bytes, aad_id: int, *, thumb: bool = False
+    ) -> bytes:
+        """手元の証憑画像暗号文 (``iv||ct||tag``) を MK 復号する。要 MK 解錠。
+
+        :meth:`download_voucher_image` が再 fetch して復号するのに対し、本メソッドは
+        既に取得済みの blob (backup export の ``image_data`` など) を再 fetch せず
+        復号する用途。
+
+        Args:
+            blob: ``iv(12B) || ciphertext || GCM tag`` の opaque blob
+            aad_id: AAD 束縛用安定識別子
+            thumb: True なら vthumb AAD で復号する
+        """
+        mk, user_id = self._require_mk()
+        table = "vthumb" if thumb else "vimg"
+        return crypto.decrypt_blob(
+            mk, blob, crypto.build_aad(table, user_id, int(aad_id))
+        )
 
     def restore_backup(self, backup_data: dict) -> dict:
         """バックアップで全データを全置換リストアする。必要なスコープ: ``backup:restore``
