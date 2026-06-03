@@ -705,15 +705,26 @@ class KakeiboClient:
             if compliance_check_enabled else None
         )
 
-        # 4. needs_ledger なら ledger 取得
+        # 4. needs_ledger なら元帳文脈をクライアント側で構築する。
+        #    E2EE 化で旧 POST /api/v1/ai/ledger-context は撤去された (サーバは
+        #    仕訳を復号できない)。MK 解錠済みなら復号仕訳から組み立て、未解錠なら
+        #    元帳なしで継続する (graceful degrade)。
         ledger_text = ""
-        if analysis.needs_ledger and analysis.requested_accounts:
-            ledger_resp = self._client.post(
-                "/api/v1/ai/ledger-context",
-                json={"account_names": analysis.requested_accounts},
+        if (
+            analysis.needs_ledger
+            and analysis.requested_accounts
+            and self.is_unlocked
+        ):
+            if analysis.date and analysis.date[:4].isdigit():
+                ledger_year = int(analysis.date[:4])
+            else:
+                ledger_year = date.today().year
+            entries = self._iter_all_journals(ledger_year)
+            ledger_text = llm.build_accounts_ledger_context(
+                account_names=analysis.requested_accounts,
+                journal_entries=entries,
+                account_list_text=prompt_context.get("account_list_text", ""),
             )
-            if ledger_resp.status_code == 200:
-                ledger_text = ledger_resp.json().get("ledger_text", "")
 
         # 5. Round 2 (画像 + 元帳 → suggestions)
         round2_prompt = llm.build_round2_prompt(

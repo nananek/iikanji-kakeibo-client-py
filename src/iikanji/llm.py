@@ -357,6 +357,110 @@ def build_round2_prompt(
     return tpl.replace("__ACCOUNT_LIST_TEXT__", account_list)
 
 
+def parse_account_list_text(account_list_text: str) -> dict[str, str]:
+    """``"1010 現金\\n5010 食費"`` 形式を ``{code: name}`` にパースする。
+
+    サーバ JS ``ledger_context.parseAccountListText`` と等価。
+    """
+    out: dict[str, str] = {}
+    if not isinstance(account_list_text, str):
+        return out
+    for line in account_list_text.split("\n"):
+        m = re.match(r"^(\d+)\s+(.+)$", line.strip())
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def _fmt_yen(n: int) -> str:
+    """金額を ``1,234`` 形式 (en-US カンマ区切り) に整形 (JS ``_fmtYen`` 等価)。"""
+    try:
+        return f"{int(n or 0):,}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def build_accounts_ledger_context(
+    *,
+    account_names: list[str],
+    journal_entries: list[Any],
+    account_list_text: str,
+    limit: int = 20,
+) -> str:
+    """AI 証憑仕訳 Round 2 用の元帳テキストを科目別に組み立てる。
+
+    サーバ JS ``ledger_context.buildAccountsLedgerContext`` の Python 移植。
+    E2EE 化で旧サーバ ``POST /api/v1/ai/ledger-context`` が撤去されたため、
+    復号済み仕訳からクライアント側で元帳文脈を構築する。
+
+    Round 1 LLM が要求した科目名 (account_names) を全科目名と部分一致で解決し、
+    各科目の明細を date desc / id desc で最大 limit 件出力する。
+
+    Args:
+        account_names: Round 1 LLM が要求した科目名
+        journal_entries: 復号済み仕訳 (``.id`` / ``.date`` / ``.description`` /
+            ``.lines`` (各 ``.account_code`` / ``.debit`` / ``.credit``) を持つ
+            JournalDetail 等)
+        account_list_text: ``"1010 現金"`` 形式の科目一覧 (prompt-context より)
+        limit: 科目あたりの明細件数
+
+    Returns:
+        整形済みテキスト。該当科目なしなら空文字。
+    """
+    if not account_names:
+        return ""
+    code_to_name = parse_account_list_text(account_list_text)
+    # JS の Object.entries は整数的キーを昇順で走査する。account_code は数字
+    # なので int(code) 昇順で揃え、Web と同じ科目順を再現する。
+    codes_ordered = sorted(
+        code_to_name,
+        key=lambda c: (int(c) if c.isdigit() else 1 << 62, c),
+    )
+    matched: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for code in codes_ordered:
+        name = code_to_name[code]
+        for req in account_names:
+            if not isinstance(req, str) or not req:
+                continue
+            if req in name or name in req:
+                if code not in seen:
+                    matched.append((code, name))
+                    seen.add(code)
+                break
+    if not matched:
+        return ""
+
+    out: list[str] = []
+    for code, name in matched:
+        rows = [
+            (entry, line)
+            for entry in journal_entries
+            for line in (getattr(entry, "lines", None) or [])
+            if getattr(line, "account_code", None) == code
+        ]
+        # date desc, id desc (date 欠落は最後尾)。
+        rows.sort(
+            key=lambda r: (getattr(r[0], "date", None) or "", int(getattr(r[0], "id", 0) or 0)),
+            reverse=True,
+        )
+        limited = rows[:limit]
+        if not limited:
+            continue
+        out.append(f"\n【{name}】（{code}）")
+        out.append("日付 | 摘要 | 借方 | 貸方")
+        out.append("-" * 50)
+        for entry, line in limited:
+            d = int(getattr(line, "debit", 0) or 0)
+            c = int(getattr(line, "credit", 0) or 0)
+            out.append(
+                f"{entry.date} | {entry.description or ''} | "
+                f"{'¥' + _fmt_yen(d) if d else '-'} | "
+                f"{'¥' + _fmt_yen(c) if c else '-'}"
+            )
+    return "\n".join(out)
+
+
 def validate_suggestions(
     raw: dict[str, Any], valid_codes: set[str],
 ) -> list[dict[str, Any]]:

@@ -675,6 +675,49 @@ def _router_client(routes: dict) -> KakeiboClient:
     return client
 
 
+class TestLedgerContext:
+    """AI Round 2 用クライアント側元帳構築 (JS ledger_context.js 互換)。"""
+
+    def test_build_accounts_ledger_context_matches_js(self) -> None:
+        from iikanji import llm
+
+        entries = [
+            JournalDetail(id=2, date="2026-02-25", entry_number=2,
+                          description="2月給与", source="", lines=[
+                              JournalLine("1010", 200000, 0),
+                              JournalLine("4010", 0, 200000)]),
+            JournalDetail(id=1, date="2026-01-25", entry_number=1,
+                          description="1月給与", source="", lines=[
+                              JournalLine("1010", 200000, 0),
+                              JournalLine("4010", 0, 200000)]),
+        ]
+        got = llm.build_accounts_ledger_context(
+            account_names=["給料収入"], journal_entries=entries,
+            account_list_text="5010 食費\n1010 現金\n4010 給料収入",
+        )
+        # JS buildAccountsLedgerContext が同入力で生成した golden 出力と byte 一致
+        golden = (
+            "\n【給料収入】（4010）\n日付 | 摘要 | 借方 | 貸方\n"
+            + "-" * 50
+            + "\n2026-02-25 | 2月給与 | - | ¥200,000"
+            + "\n2026-01-25 | 1月給与 | - | ¥200,000"
+        )
+        assert got == golden
+
+    def test_no_match_returns_empty(self) -> None:
+        from iikanji import llm
+        assert llm.build_accounts_ledger_context(
+            account_names=["存在しない科目"], journal_entries=[],
+            account_list_text="1010 現金",
+        ) == ""
+
+    def test_empty_account_names_returns_empty(self) -> None:
+        from iikanji import llm
+        assert llm.build_accounts_ledger_context(
+            account_names=[], journal_entries=[], account_list_text="1010 現金",
+        ) == ""
+
+
 class TestReports:
     def test_list_accounts(self) -> None:
         body = {"ok": True, "accounts": [
@@ -1105,9 +1148,20 @@ class TestAnalyze:
         assert patch_body["model"] == "gpt-4o"
         assert len(patch_body["suggestions"]) == 1
 
-    def test_needs_ledger_fetches_ledger_context(self) -> None:
-        """Round 1 で needs_ledger=true なら ledger-context POST を挟む。"""
+    def test_needs_ledger_builds_client_side(self) -> None:
+        """needs_ledger=true なら復号仕訳から元帳をクライアント側で構築する。
+
+        E2EE 化で旧 POST /api/v1/ai/ledger-context は撤去された。MK 解錠済みなら
+        /api/v1/journals を取得・復号して元帳文脈を組み立て、Round 2 プロンプトに
+        埋め込む。
+        """
         server_calls: list[httpx.Request] = []
+        # 給料収入(4010) の元帳になる仕訳 (年度 2026)
+        year_journals = [
+            _enc_entry_wire(2, date="2026-02-25", description="2月給与",
+                            lines=[{"account_code": "1010", "debit": 200000, "description": ""},
+                                   {"account_code": "4010", "credit": 200000, "description": ""}]),
+        ]
 
         def server_handler(request: httpx.Request) -> httpx.Response:
             server_calls.append(request)
@@ -1115,9 +1169,14 @@ class TestAnalyze:
             if path == "/api/v1/ai/uploads":
                 return httpx.Response(201, json={"ok": True, "draft_id": 7})
             if path == "/api/v1/ai/prompt-context":
-                return httpx.Response(200, json=self._PROMPT_CTX)
-            if path == "/api/v1/ai/ledger-context":
-                return httpx.Response(200, json={"ledger_text": "LEDGER_DATA"})
+                ctx = dict(self._PROMPT_CTX)
+                ctx["account_list_text"] = "1010 現金\n4010 給料収入"
+                return httpx.Response(200, json=ctx)
+            if path == "/api/v1/journals":
+                return httpx.Response(200, json={
+                    "ok": True, "journals": year_journals,
+                    "total": 1, "page": 1, "per_page": 100,
+                })
             if path.endswith("/suggestions"):
                 return httpx.Response(200, json={"ok": True})
             return httpx.Response(404)
@@ -1126,17 +1185,17 @@ class TestAnalyze:
             self._make_openai_response({
                 "date": "2026-02-15", "description": "給与",
                 "amount": 250000, "document_type": "payslip",
-                "needs_ledger": True, "requested_accounts": ["給料手当"],
+                "needs_ledger": True, "requested_accounts": ["給料収入"],
             }),
             self._make_openai_response({
                 "suggestions": [{
                     "title": "給与", "description": "",
                     "date": "2026-02-15", "entry_description": "給与",
                     "lines": [
-                        {"account_code": "5010", "debit_amount": 250000,
-                         "credit_amount": 0},
-                        {"account_code": "1010", "debit_amount": 0,
+                        {"account_code": "4010", "debit_amount": 0,
                          "credit_amount": 250000},
+                        {"account_code": "1010", "debit_amount": 250000,
+                         "credit_amount": 0},
                     ],
                 }],
             }),
@@ -1149,7 +1208,7 @@ class TestAnalyze:
             round2_seen_prompt.append(prompt)
             return openai_responses.pop(0)
 
-        with KakeiboClient(
+        client = KakeiboClient(
             "https://test.example.com", "ik_testkey",
             openai_api_key="sk-x",
             http_client=httpx.Client(
@@ -1160,15 +1219,66 @@ class TestAnalyze:
             llm_http_client=httpx.Client(
                 transport=httpx.MockTransport(openai_handler),
             ),
-        ) as client:
+        )
+        _set_mk(client)  # 元帳構築には MK 解錠が必要
+        with client:
             client.analyze(b"\xff\xd8")
 
-        # ledger-context が呼ばれた
-        assert any(
-            r.url.path == "/api/v1/ai/ledger-context" for r in server_calls
+        # 廃止された ledger-context は呼ばれない
+        assert all(
+            r.url.path != "/api/v1/ai/ledger-context" for r in server_calls
         )
-        # Round 2 プロンプトに LEDGER_DATA が含まれる
-        assert "LEDGER_DATA" in round2_seen_prompt[1]
+        # 仕訳を取得して元帳を構築している
+        assert any(r.url.path == "/api/v1/journals" for r in server_calls)
+        # Round 2 プロンプトにクライアント構築の元帳 (科目名/明細) が含まれる
+        assert "【給料収入】（4010）" in round2_seen_prompt[1]
+        assert "2月給与" in round2_seen_prompt[1]
+
+    def test_needs_ledger_without_mk_skips_ledger(self) -> None:
+        """MK 未解錠なら元帳なしで継続する (graceful degrade、journals は叩かない)。"""
+        server_calls: list[httpx.Request] = []
+
+        def server_handler(request: httpx.Request) -> httpx.Response:
+            server_calls.append(request)
+            path = request.url.path
+            if path == "/api/v1/ai/uploads":
+                return httpx.Response(201, json={"ok": True, "draft_id": 7})
+            if path == "/api/v1/ai/prompt-context":
+                return httpx.Response(200, json=self._PROMPT_CTX)
+            if path.endswith("/suggestions"):
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(404)
+
+        openai_responses = [
+            self._make_openai_response({
+                "date": "2026-02-15", "description": "給与", "amount": 250000,
+                "document_type": "payslip", "needs_ledger": True,
+                "requested_accounts": ["給料収入"],
+            }),
+            self._make_openai_response({"suggestions": [{
+                "title": "給与", "date": "2026-02-15", "entry_description": "給与",
+                "lines": [{"account_code": "5010", "debit_amount": 250000, "credit_amount": 0},
+                          {"account_code": "1010", "debit_amount": 0, "credit_amount": 250000}],
+            }]}),
+        ]
+
+        def openai_handler(request: httpx.Request) -> httpx.Response:
+            return openai_responses.pop(0)
+
+        client = KakeiboClient(
+            "https://test.example.com", "ik_testkey", openai_api_key="sk-x",
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(server_handler),
+                base_url="https://test.example.com",
+                headers={"Authorization": "Bearer ik_testkey"},
+            ),
+            llm_http_client=httpx.Client(transport=httpx.MockTransport(openai_handler)),
+        )
+        # MK 未解錠のまま (unlocked にしない)
+        with client:
+            client.analyze(b"\xff\xd8")
+        # journals は取得しない (元帳スキップ)
+        assert all(r.url.path != "/api/v1/journals" for r in server_calls)
 
     def test_uploads_error_propagates(self) -> None:
         """uploads が失敗したら早期 raise。"""
