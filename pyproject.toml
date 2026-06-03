@@ -11,6 +11,7 @@ dependencies = [
     "argon2-cffi>=23",
     "keyring>=24",
     "Pillow>=10",
+    "pyhpke>=0.6",
 ]
 
 [project.scripts]
