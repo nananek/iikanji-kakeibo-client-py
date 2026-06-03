@@ -13,6 +13,8 @@ from .models import (
     JournalDetail,
     JournalLine,
     JournalListResponse,
+    MedicalExpense,
+    MedicalExpenseListResponse,
 )
 
 __all__ = [
@@ -21,6 +23,8 @@ __all__ = [
     "JournalCreateResponse",
     "JournalDetail",
     "JournalListResponse",
+    "MedicalExpense",
+    "MedicalExpenseListResponse",
     "AnalyzeResponse",
     "DraftDetail",
     "DraftListItem",

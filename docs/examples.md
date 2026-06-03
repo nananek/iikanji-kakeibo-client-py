@@ -96,6 +96,35 @@ with KakeiboClient("https://example.com", "ik_your_key") as client:
         print(f"  科目{line.account_code}: 借方{line.debit} 貸方{line.credit}")
 ```
 
+## 医療費明細（医療費控除）
+
+医療費明細は仕訳に紐付けて登録します（1 仕訳に 1 件、`journal_entry_id` で upsert）。
+
+```python
+from iikanji import KakeiboClient
+
+with KakeiboClient("https://example.com", "ik_your_key") as client:
+    if not client.is_unlocked:
+        client.unlock("あなたのパスフレーズ")
+
+    # まず医療費の支払い仕訳を作成し、その仕訳に医療費明細を紐付ける
+    me_id = client.upsert_medical_expense(
+        journal_entry_id=42,
+        date="2026-03-20",
+        patient_name="山田太郎",
+        hospital_name="○○歯科クリニック",
+        treatment_description="歯科治療",
+        provider_type="hospital",   # hospital / pharmacy / nursing / other
+        amount_paid=12000,
+        insurance_reimbursement=4000,
+    )
+
+    # 年度の医療費明細を一覧（医療費控除の集計などに利用）
+    result = client.list_medical_expenses(fiscal_year=2026)
+    total = sum(e.amount_paid - e.insurance_reimbursement for e in result.expenses)
+    print(f"{result.total}件 / 自己負担合計 {total}円")
+```
+
 ## 仕訳の削除
 
 ```python

@@ -48,6 +48,23 @@ GOLDEN_RECORD = {
     "fiscal_period": None,
 }
 
+# 医療費 (me) record の golden vector (同じ固定 MK / user_id=42)
+GOLDEN_AAD_ME_HEX = "6d6500000000000000002a"
+GOLDEN_ME_IV = base64.b64decode("MjM0NTY3ODk6Ozw9")
+GOLDEN_ME_BLOB = base64.b64decode(
+    "+JfBntJQcX7H2USNCzNkMAGQJqKBFNqcxx8hD23zuW9JGDaUKsGQnSTbSN99BIUCm+R2FFST4mOEltpKku4kcinM+FQcWxLO5zxw1iMbZsknKD7xMVLQPKXGD0xH39f053ZEidvCZLX9f7pNeCMuY70JcTdQiuPP67n3MubonM9iE4r0+w/foCi16LUMLhdSTlyoHIxiwInymPjNpH6ry7EKoiFm+cUvxu+zXRD/tmvNWbrF+/qboOnxNP0fUUiERuZfVbsAfrTeq0Z5OPAAhlz2RwVk0JqZAeZoiqM="
+)
+GOLDEN_ME_RECORD = {
+    "v": 1,
+    "date": "2026-03-20",
+    "patient_name": "山田太郎",
+    "hospital_name": "○○病院",
+    "treatment_description": "歯科治療",
+    "provider_type": "hospital",
+    "amount_paid": 12000,
+    "insurance_reimbursement": 4000,
+}
+
 
 class TestInteropGoldenVectors:
     def test_argon2id_matches_js(self) -> None:
@@ -84,6 +101,15 @@ class TestInteropGoldenVectors:
         ).encode("utf-8")
         ct = AESGCM(mk).encrypt(GOLDEN_REC_IV, pt, aad)
         assert ct == GOLDEN_REC_BLOB
+
+    def test_me_aad_matches_js(self) -> None:
+        assert crypto.build_aad("me", GOLDEN_USER_ID).hex() == GOLDEN_AAD_ME_HEX
+
+    def test_me_decrypt_record_matches_js(self) -> None:
+        mk = bytes.fromhex(GOLDEN_MK_HEX)
+        aad = crypto.build_aad("me", GOLDEN_USER_ID)
+        body = crypto.decrypt_record(mk, GOLDEN_ME_BLOB, GOLDEN_ME_IV, aad)
+        assert body == GOLDEN_ME_RECORD
 
 
 class TestAAD:

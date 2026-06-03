@@ -18,6 +18,8 @@ from iikanji import (
     KakeiboAPIError,
     KakeiboClient,
     LockedError,
+    MedicalExpense,
+    MedicalExpenseListResponse,
     crypto,
 )
 
@@ -474,6 +476,151 @@ class TestListJournals:
         assert "fiscal_year=2026" in url
         assert "page=2" in url
         assert "per_page=10" in url
+
+
+def _enc_me_wire(
+    expense_id: int,
+    journal_entry_id: int,
+    *,
+    date: str = "2026-03-20",
+    patient_name: str = "山田太郎",
+    hospital_name: str = "○○病院",
+    treatment_description: str = "歯科治療",
+    provider_type: str | None = "hospital",
+    amount_paid: int = 12000,
+    insurance_reimbursement: int = 4000,
+) -> dict:
+    """GET /api/v1/medical-expenses の (暗号化済み) expense dict を生成する。"""
+    body = {
+        "v": 1,
+        "date": date,
+        "patient_name": patient_name,
+        "hospital_name": hospital_name,
+        "treatment_description": treatment_description,
+        "provider_type": provider_type,
+        "amount_paid": amount_paid,
+        "insurance_reimbursement": insurance_reimbursement,
+    }
+    blob, iv = crypto.encrypt_record(
+        TEST_MK, body, crypto.build_aad("me", TEST_USER_ID)
+    )
+    return {
+        "id": expense_id,
+        "journal_entry_id": journal_entry_id,
+        "encrypted_blob": crypto.b64encode(blob),
+        "blob_iv": crypto.b64encode(iv),
+    }
+
+
+class TestMedicalExpense:
+    def test_upsert_success(self) -> None:
+        captured: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True, "id": 5})
+
+        http_client = httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url=BASE_URL,
+            headers={"Authorization": "Bearer ik_testkey"},
+        )
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        _set_mk(client)
+        with client:
+            me_id = client.upsert_medical_expense(
+                journal_entry_id=42,
+                date="2026-03-20",
+                patient_name="山田太郎",
+                hospital_name="○○病院",
+                treatment_description="歯科治療",
+                provider_type="hospital",
+                amount_paid=12000,
+                insurance_reimbursement=4000,
+            )
+        assert me_id == 5
+        payload = captured[0]
+        # 平文 wire は journal_entry_id のみ
+        assert payload["journal_entry_id"] == 42
+        assert "patient_name" not in payload and "amount_paid" not in payload
+        assert "encrypted_blob" in payload and "blob_iv" in payload
+        body = crypto.decrypt_record(
+            TEST_MK,
+            crypto.b64decode(payload["encrypted_blob"]),
+            crypto.b64decode(payload["blob_iv"]),
+            crypto.build_aad("me", TEST_USER_ID),
+        )
+        assert body["patient_name"] == "山田太郎"
+        assert body["amount_paid"] == 12000
+        assert body["provider_type"] == "hospital"
+
+    def test_upsert_requires_unlock(self) -> None:
+        client = _make_client(200, {"ok": True, "id": 1}, unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.upsert_medical_expense(journal_entry_id=1)
+
+    def test_negative_amount_raises(self) -> None:
+        client = _make_client(200, {"ok": True, "id": 1})
+        with client, pytest.raises(ValueError):
+            client.upsert_medical_expense(journal_entry_id=1, amount_paid=-100)
+
+    def test_journal_not_found(self) -> None:
+        client = _make_client(404, {"error": "仕訳が見つかりません。"})
+        with client, pytest.raises(KakeiboAPIError) as exc_info:
+            client.upsert_medical_expense(journal_entry_id=999)
+        assert exc_info.value.status_code == 404
+
+    def test_list_success(self) -> None:
+        body = {
+            "ok": True,
+            "expenses": [_enc_me_wire(5, 42), _enc_me_wire(6, 43, patient_name="花子")],
+            "total": 2,
+        }
+        client = _make_client(200, body)
+        with client:
+            result = client.list_medical_expenses(fiscal_year=2026)
+        assert isinstance(result, MedicalExpenseListResponse)
+        assert result.total == 2
+        assert result.expenses[0].id == 5
+        assert result.expenses[0].journal_entry_id == 42
+        assert result.expenses[0].patient_name == "山田太郎"
+        assert result.expenses[0].amount_paid == 12000
+        assert result.expenses[1].patient_name == "花子"
+
+    def test_list_sends_fiscal_year(self) -> None:
+        urls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            urls.append(str(request.url))
+            return httpx.Response(200, json={"ok": True, "expenses": [], "total": 0})
+
+        http_client = httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url=BASE_URL,
+            headers={"Authorization": "Bearer ik_testkey"},
+        )
+        client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+        _set_mk(client)
+        with client:
+            client.list_medical_expenses(fiscal_year=2026)
+        assert "fiscal_year=2026" in urls[0]
+
+    def test_list_requires_unlock(self) -> None:
+        client = _make_client(200, {"ok": True, "expenses": [], "total": 0}, unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.list_medical_expenses()
+
+    def test_from_api_decrypt_failure_falls_back(self) -> None:
+        """復号失敗 (壊れた blob) でもフィールドは既定値で復元する。"""
+        bad = {
+            "id": 9,
+            "journal_entry_id": 1,
+            "encrypted_blob": crypto.b64encode(b"not-a-valid-ciphertext-xxxxxxxxxx"),
+            "blob_iv": crypto.b64encode(b"0" * 12),
+        }
+        me = MedicalExpense.from_api(bad, TEST_MK, TEST_USER_ID)
+        assert me.id == 9 and me.journal_entry_id == 1
+        assert me.patient_name == "" and me.amount_paid == 0
 
 
 def _wrapped_keys_body() -> dict:
