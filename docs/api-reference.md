@@ -409,6 +409,65 @@ verify_voucher(voucher_id: int) -> dict
 
 **戻り値:** `{"ok", "verified", "stored_hash", "computed_hash"}` 等の生 JSON。
 
+#### `export_backup`
+
+全データバックアップを**暗号文のまま**取得する。必要なスコープ: `journals:read`（MK 不要）
+
+```python
+export_backup() -> dict
+```
+
+`GET /api/v1/backup/export` のレスポンスをそのまま返します。各レコードは `encrypted_blob`
+を保持した暗号文で、サーバーは平文を持ちません。この形式は `restore_backup` でそのまま
+復元できます。
+
+#### `export_backup_decrypted`
+
+全データバックアップを取得し MK で復号して**平文 dict** にする。必要なスコープ: `journals:read`（要 MK 解錠）
+
+```python
+export_backup_decrypted() -> dict
+```
+
+je/jel/me/bcb の暗号文を復号して各行に展開します（復号できない行は `_decryptError` を付与）。
+vouchers の画像やメタ、AI 設定の `api_key_blob` はパススルーします。**この形式は復元には
+使えません**（暗号文が落ちるため）。人間可読な出力や集計に使います。
+
+#### `restore_backup`
+
+バックアップで全データを全置換リストアする。必要なスコープ: `backup:restore`
+
+```python
+restore_backup(backup_data: dict) -> dict
+```
+
+`backup_data` は `export_backup()` が返す**暗号文** backup（`encrypted_blob` を保持）を
+渡します。`POST /api/v1/backup/restore` で本人の全関連データを delete → INSERT で再構築
+します（1 トランザクション）。貸借不一致・不正 FK 等は 400。**戻り値:** 復元件数の dict。
+
+#### `save_encrypted_backup`
+
+暗号文バックアップを取得し `.ikbackup` パスフレーズアーカイブとして保存する。必要なスコープ: `journals:read`（MK 不要）
+
+```python
+save_encrypted_backup(path: str | Path, passphrase: str) -> None
+```
+
+暗号文 backup を MK と独立したパスフレーズ（Argon2id + AES-256-GCM、8 文字以上）でさらに
+包んで保存します。保存物は `encrypted_blob` を保持するため `restore_encrypted_backup` で
+そのまま復元できます。
+
+#### `restore_encrypted_backup`
+
+`.ikbackup` アーカイブを復号して全置換リストアする。必要なスコープ: `backup:restore`
+
+```python
+restore_encrypted_backup(path: str | Path, passphrase: str) -> dict
+```
+
+`save_encrypted_backup` で保存したアーカイブをパスフレーズで復号し、暗号文 backup を
+`restore_backup` に渡します。**戻り値:** 復元件数の dict。
+
 #### `close`
 
 内部の HTTP クライアントを閉じる。コンテキストマネージャ使用時は自動的に呼ばれる。

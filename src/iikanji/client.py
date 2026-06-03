@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+import json
+
+from . import backup as backup_mod
 from . import crypto, thumbnail
 from .exceptions import AuthenticationError, KakeiboAPIError, LockedError
 from pathlib import Path
@@ -1030,6 +1033,87 @@ class KakeiboClient:
         if resp.status_code == 200:
             return resp.json()
         self._raise_for_error(resp)
+
+    # --- 全データバックアップ / リストア (v5 BU) ---
+
+    def export_backup(self) -> dict:
+        """全データバックアップ (暗号文のまま) を取得する。必要なスコープ: ``journals:read``
+
+        ``GET /api/v1/backup/export`` のレスポンスをそのまま返す。各 record は
+        ``encrypted_blob`` を保持した **暗号文** で、サーバーは平文を持ちません。
+        この形式は :meth:`restore_backup` でそのまま復元できます。中身を人間可読に
+        したい場合は :meth:`export_backup_decrypted` を使ってください (要 MK)。
+
+        Returns:
+            backup dict (``version`` / ``exported_at`` / ``user_id`` / ``data``)。
+        """
+        resp = self._client.get("/api/v1/backup/export")
+        if resp.status_code == 200:
+            return resp.json()
+        self._raise_for_error(resp)
+
+    def export_backup_decrypted(self) -> dict:
+        """全データバックアップを取得し MK で復号して平文 dict にする。要 MK 解錠。
+
+        必要なスコープ: ``journals:read``。je/jel/me/bcb の暗号文を復号して各行に
+        展開します (復号できない行は ``_decryptError`` を付与)。**この形式は復元には
+        使えません** (暗号文が落ちるため)。復元用は :meth:`export_backup` を使います。
+        """
+        mk, user_id = self._require_mk()
+        raw = self.export_backup()
+        return backup_mod.decrypt_backup(mk, user_id, raw)
+
+    def restore_backup(self, backup_data: dict) -> dict:
+        """バックアップで全データを全置換リストアする。必要なスコープ: ``backup:restore``
+
+        ``backup_data`` は :meth:`export_backup` が返す **暗号文** backup
+        (``encrypted_blob`` を保持) を渡します。``POST /api/v1/backup/restore`` で
+        本人の全関連データを delete → INSERT で再構築します (1 トランザクション)。
+
+        Returns:
+            復元件数 (``{"tables": {...}}`` 等のサーバー JSON の ``restored``)。
+
+        Raises:
+            KakeiboAPIError: 検証エラー (貸借不一致・不正 FK 等は 400)
+        """
+        resp = self._client.post("/api/v1/backup/restore", json=backup_data)
+        if resp.status_code == 200:
+            return resp.json().get("restored", {})
+        self._raise_for_error(resp)
+
+    def save_encrypted_backup(self, path: str | Path, passphrase: str) -> None:
+        """暗号文バックアップを取得し ``.ikbackup`` パスフレーズアーカイブとして保存する。
+
+        必要なスコープ: ``journals:read``（MK 不要）。暗号文 backup を MK と独立した
+        パスフレーズ (Argon2id + AES-256-GCM) でさらに包んで保存します。保存物は
+        ``encrypted_blob`` を保持するため :meth:`restore_encrypted_backup` で
+        そのまま復元できます。
+
+        Args:
+            path: 出力先 (例: ``backup.ikbackup``)
+            passphrase: 8 文字以上のパスフレーズ (MK とは別の災害用鍵)
+        """
+        raw = self.export_backup()
+        data = json.dumps(raw, ensure_ascii=False).encode("utf-8")
+        archive = crypto.encrypt_backup_archive(data, passphrase)
+        Path(path).write_bytes(archive)
+
+    def restore_encrypted_backup(
+        self, path: str | Path, passphrase: str
+    ) -> dict:
+        """``.ikbackup`` アーカイブを復号して全置換リストアする。
+
+        必要なスコープ: ``backup:restore``。:meth:`save_encrypted_backup` で保存した
+        アーカイブをパスフレーズで復号し、暗号文 backup を
+        :meth:`restore_backup` に渡します。
+
+        Returns:
+            復元件数 (サーバー JSON の ``restored``)。
+        """
+        archive = Path(path).read_bytes()
+        data = crypto.decrypt_backup_archive(archive, passphrase)
+        backup_data = json.loads(data.decode("utf-8"))
+        return self.restore_backup(backup_data)
 
     # --- 内部ヘルパー ---
 

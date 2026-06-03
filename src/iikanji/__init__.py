@@ -1,5 +1,6 @@
 """いいかんじ家計簿 Python クライアント"""
 
+from . import backup
 from . import crypto
 from .client import KakeiboClient
 from .exceptions import AuthenticationError, KakeiboAPIError, LockedError
@@ -46,4 +47,5 @@ __all__ = [
     "AuthenticationError",
     "LockedError",
     "crypto",
+    "backup",
 ]

@@ -1802,3 +1802,150 @@ class TestVerifyVoucher:
         with client, pytest.raises(KakeiboAPIError) as exc:
             client.verify_voucher(99)
         assert exc.value.status_code == 404
+
+
+# ========== 全データバックアップ / リストア (v5 BU) ==========
+
+
+def _enc(rec: dict, table: str, *ids: int) -> tuple[str, str]:
+    blob, iv = crypto.encrypt_record(TEST_MK, rec, crypto.build_aad(table, TEST_USER_ID, *ids))
+    return crypto.b64encode(blob), crypto.b64encode(iv)
+
+
+def _encrypted_backup() -> dict:
+    je_b, je_iv = _enc(
+        {"v": 1, "date": "2026-02-15", "description": "弁当", "source": "api",
+         "fiscal_period": None}, "je",
+    )
+    return {
+        "version": "1.0",
+        "exported_at": "2026-06-03T00:00:00",
+        "user_id": TEST_USER_ID,
+        "data": {
+            "accounts": [{"code": "1010"}],
+            "fiscal_closes": [],
+            "journal_entries": [
+                {"id": 1, "encrypted_blob": je_b, "blob_iv": je_iv},
+            ],
+            "journal_entry_lines": [],
+            "medical_expenses": [],
+            "balance_cache_blobs": [],
+            "vouchers": [],
+            "ai_drafts": [],
+            "user_ai_config": None,
+            "tax_form_mappings": [],
+            "csv_column_profiles": [],
+        },
+    }
+
+
+class TestExportBackup:
+    def test_export_raw(self) -> None:
+        body = _encrypted_backup()
+        client = _make_client(200, body, unlocked=False)
+        with client:
+            out = client.export_backup()
+        # 暗号文をそのまま返す (encrypted_blob 保持)
+        assert out["data"]["journal_entries"][0]["encrypted_blob"]
+        assert out["user_id"] == TEST_USER_ID
+
+    def test_export_decrypted(self) -> None:
+        client = _make_client(200, _encrypted_backup())
+        with client:
+            out = client.export_backup_decrypted()
+        je = out["data"]["journal_entries"][0]
+        assert je["description"] == "弁当"
+        assert "encrypted_blob" not in je
+
+    def test_export_decrypted_requires_mk(self) -> None:
+        client = _make_client(200, _encrypted_backup(), unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.export_backup_decrypted()
+
+    def test_export_error(self) -> None:
+        client = _make_client(429, {"error": "レート制限"}, unlocked=False)
+        with client, pytest.raises(KakeiboAPIError) as exc:
+            client.export_backup()
+        assert exc.value.status_code == 429
+
+
+class TestRestoreBackup:
+    def test_restore_posts_payload(self) -> None:
+        log: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            log.append(request)
+            return httpx.Response(200, json={"ok": True, "restored": {"tables": {"journal_entries": 1}}})
+
+        http_client = httpx.Client(
+            transport=httpx.MockTransport(handler), base_url=BASE_URL,
+            headers={"Authorization": "Bearer x"},
+        )
+        client = KakeiboClient(BASE_URL, "x", http_client=http_client)
+        backup = _encrypted_backup()
+        with client:
+            restored = client.restore_backup(backup)
+        assert restored == {"tables": {"journal_entries": 1}}
+        assert json.loads(log[0].content)["data"]["journal_entries"][0]["encrypted_blob"]
+
+    def test_restore_validation_error(self) -> None:
+        client = _make_client(400, {"error": "貸借が一致しません。"}, unlocked=False)
+        with client, pytest.raises(KakeiboAPIError) as exc:
+            client.restore_backup(_encrypted_backup())
+        assert exc.value.status_code == 400
+
+
+class TestEncryptedBackupRoundTrip:
+    def test_save_then_restore(self, tmp_path) -> None:
+        backup = _encrypted_backup()
+        captured: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/api/v1/backup/export":
+                return httpx.Response(200, json=backup)
+            if request.method == "POST" and request.url.path == "/api/v1/backup/restore":
+                captured.append(json.loads(request.content))
+                return httpx.Response(200, json={"ok": True, "restored": {"ok": 1}})
+            return httpx.Response(404, json={"error": "nf"})
+
+        def make_client() -> KakeiboClient:
+            hc = httpx.Client(
+                transport=httpx.MockTransport(handler), base_url=BASE_URL,
+                headers={"Authorization": "Bearer x"},
+            )
+            return KakeiboClient(BASE_URL, "x", http_client=hc)
+
+        path = tmp_path / "backup.ikbackup"
+        # 高速化のため小さい Argon2 params を直接使って保存
+        raw = make_client().export_backup()
+        data = json.dumps(raw, ensure_ascii=False).encode("utf-8")
+        path.write_bytes(crypto.encrypt_backup_archive(
+            data, "disasterpass123", params={"memory": 512, "iterations": 1, "parallelism": 1},
+        ))
+
+        # アーカイブは暗号文 backup を保持 → 復号して restore に渡せる
+        restored = make_client().restore_encrypted_backup(path, "disasterpass123")
+        assert restored == {"ok": 1}
+        # restore に渡った payload は元の暗号文 backup と一致 (encrypted_blob 保持)
+        assert captured[0]["data"]["journal_entries"][0]["encrypted_blob"] == \
+            backup["data"]["journal_entries"][0]["encrypted_blob"]
+
+    def test_save_encrypted_backup_writes_ikbackup(self, tmp_path) -> None:
+        backup = _encrypted_backup()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=backup)
+
+        hc = httpx.Client(
+            transport=httpx.MockTransport(handler), base_url=BASE_URL,
+            headers={"Authorization": "Bearer x"},
+        )
+        client = KakeiboClient(BASE_URL, "x", http_client=hc)
+        path = tmp_path / "out.ikbackup"
+        with client:
+            client.save_encrypted_backup(path, "disasterpass123")
+        blob = path.read_bytes()
+        assert blob[:8] == b"IKBKP\x00\x00\x00"
+        # デフォルト params で復号でき、暗号文 backup が往復する
+        restored = json.loads(crypto.decrypt_backup_archive(blob, "disasterpass123"))
+        assert restored["user_id"] == TEST_USER_ID
