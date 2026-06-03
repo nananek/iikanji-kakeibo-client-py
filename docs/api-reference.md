@@ -192,6 +192,69 @@ list_medical_expenses(*, fiscal_year: int | None = None) -> MedicalExpenseListRe
 
 **戻り値:** `MedicalExpenseListResponse`（`expenses: list[MedicalExpense]`, `total: int`）
 
+#### `list_accounts`
+
+勘定科目の一覧を取得する。必要なスコープ: `journals:read`（MK 解錠は不要 — 科目は
+E2EE 対象外で平文）
+
+```python
+list_accounts() -> list[Account]
+```
+
+**戻り値:** `list[Account]`（`code` / `name` / `account_type`（asset/liability/equity/
+revenue/expense）/ `account_type_name` / `normal_balance`（debit/credit）/ `is_active`
+/ `system_role` / `tax_category` / `cost_type` / `display_order`）
+
+#### `list_balance_cache_blobs`
+
+月次確定済み期間の残高キャッシュを取得・復号する（**読み込みのみ**）。必要なスコープ:
+`journals:read`（要 MK 解錠）
+
+```python
+list_balance_cache_blobs(year: int) -> dict[int, dict[str, tuple[int, int]]]
+```
+
+**戻り値:** `{period: {account_code: (debit, credit)}}`（period: 0=期首 / 1-12=月 /
+13-16=決算整理・損益振替）。キャッシュの生成・更新は owner（Web）の月次確定で行います。
+
+#### `search_journals`
+
+仕訳を取得し、クライアント側で復号後にフィルタする。必要なスコープ: `journals:read`
+（要 MK 解錠）
+
+```python
+search_journals(
+    *,
+    fiscal_year: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    text: str | None = None,
+    account_code: str | None = None,
+) -> list[JournalDetail]
+```
+
+E2EE のためサーバー側の絞り込みは年度単位のみ。日付・摘要・科目での絞り込みは復号後に
+クライアント側で行います（`text` は仕訳・明細いずれかの摘要の部分一致、`account_code`
+はいずれかの明細が一致）。
+
+#### `trial_balance`
+
+試算表（科目単位の借方/貸方合計 + 残高）を集計する。必要なスコープ: `journals:read`
+（要 MK 解錠）
+
+```python
+trial_balance(*, fiscal_year: int, include_closing: bool = False) -> TrialBalance
+```
+
+明細の `account_code` / `debit` / `credit`（平文メタ）を集計し、科目名・区分・正常残高を
+`list_accounts` から付与します。残高は各科目の `normal_balance` に従い、借方科目は
+`debit - credit`、貸方科目は `credit - debit` を正とします。`include_closing=False`
+（既定）では損益振替（`is_closing`）仕訳を除外した決算振替前の試算表になります。
+
+**戻り値:** `TrialBalance`（`fiscal_year`, `rows: list[TrialBalanceRow]`,
+`total_debit`, `total_credit`）。`TrialBalanceRow` = `code` / `name` / `account_type`
+/ `debit` / `credit` / `balance`。
+
 #### `analyze`
 
 画像を AI 解析して下書きを作成する。必要なスコープ: `ai:analyze`

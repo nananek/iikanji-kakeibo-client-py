@@ -312,6 +312,62 @@ class MedicalExpenseListResponse:
     total: int
 
 
+# --- 勘定科目 / レポート集計 ---
+
+
+@dataclass
+class Account:
+    """勘定科目 (E2EE 対象外・平文)。"""
+
+    code: str
+    name: str
+    account_type: str  # asset / liability / equity / revenue / expense
+    account_type_name: str  # 資産 / 負債 / 純資産 / 収益 / 費用
+    normal_balance: str  # "debit" / "credit"
+    is_active: bool = True
+    system_role: str | None = None
+    tax_category: str | None = None
+    cost_type: str | None = None
+    display_order: int = 0
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Account:
+        return cls(
+            code=d["code"],
+            name=d.get("name", ""),
+            account_type=d.get("account_type", ""),
+            account_type_name=d.get("account_type_name", ""),
+            normal_balance=d.get("normal_balance", "debit"),
+            is_active=bool(d.get("is_active", True)),
+            system_role=d.get("system_role"),
+            tax_category=d.get("tax_category"),
+            cost_type=d.get("cost_type"),
+            display_order=int(d.get("display_order", 0) or 0),
+        )
+
+
+@dataclass
+class TrialBalanceRow:
+    """試算表の 1 科目行。"""
+
+    code: str
+    name: str
+    account_type: str
+    debit: int  # 借方合計
+    credit: int  # 貸方合計
+    balance: int  # 正常残高側を正とした残高 (normal_balance に従う)
+
+
+@dataclass
+class TrialBalance:
+    """試算表 (account_code 単位の借方/貸方合計 + 科目名・区分付き)。"""
+
+    fiscal_year: int
+    rows: list[TrialBalanceRow]
+    total_debit: int
+    total_credit: int
+
+
 # --- AI 証憑仕訳 ---
 
 

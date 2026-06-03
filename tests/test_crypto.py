@@ -111,6 +111,22 @@ class TestInteropGoldenVectors:
         body = crypto.decrypt_record(mk, GOLDEN_ME_BLOB, GOLDEN_ME_IV, aad)
         assert body == GOLDEN_ME_RECORD
 
+    def test_bcb_aad_matches_js(self) -> None:
+        # bcb は id 1 個 (year*100 + period)
+        aad = crypto.build_aad("bcb", GOLDEN_USER_ID, 2026 * 100 + 12)
+        assert aad.hex() == "62636200000000000000002a000000000000031774"
+
+    def test_bcb_decrypt_record_matches_js(self) -> None:
+        mk = bytes.fromhex(GOLDEN_MK_HEX)
+        iv = base64.b64decode("RkdISUpLTE1OT1BR")
+        blob = base64.b64decode(
+            "HYj9pOPTo5JfyAVoVekoC2vxpNl8/9zGtt1kTTymKfsxfYMPNKJsRffUkZzAz7VUmpUwaV1puQ=="
+        )
+        aad = crypto.build_aad("bcb", GOLDEN_USER_ID, 2026 * 100 + 12)
+        rec = crypto.decrypt_record(mk, blob, iv, aad)
+        # bcb は生マップ {account_code: [debit, credit]} ({v:1} 包みなし)
+        assert rec == {"1010": [50000, 20000], "5010": [12000, 0]}
+
 
 class TestAAD:
     def test_je_jel_me_no_extra_id(self) -> None:
