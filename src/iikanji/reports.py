@@ -255,6 +255,85 @@ def compute_monthly_comparison(
     }
 
 
+def compute_ledger(
+    entries: list[dict],
+    *,
+    account_code: str,
+    normal_balance: str,
+    opening_balance: int = 0,
+    fiscal_period_from: int = 0,
+    fiscal_period_to: int = 16,
+    include_closing: bool = True,
+) -> dict:
+    """指定科目の総勘定元帳 (ledger.js: computeLedger)。
+
+    date は暗号化のためサーバの ``ORDER BY date`` を再現できず、``entry.id`` 昇順
+    (作成順 ≈ 時系列) で並べる。``opening_balance`` (前期繰越) は呼出側が指定する。
+
+    Returns:
+        ``{opening_balance, rows, closing_balance, total_debit, total_credit}``。
+        rows = ``{entry_id, fiscal_period, date, description, debit, credit,
+        balance, counterparts}``。counterparts = 当該 entry 内の他 line の科目
+        コードをカンマ区切り。
+    """
+    if normal_balance not in ("debit", "credit"):
+        raise ValueError("normal_balance must be 'debit' or 'credit'")
+
+    ordered = sorted(entries, key=lambda e: e.get("id") or 0)
+    rows = []
+    balance = opening_balance
+    total_debit = 0
+    total_credit = 0
+
+    for entry in ordered:
+        fp = entry.get("fiscal_month") or 0
+        if fp < fiscal_period_from or fp > fiscal_period_to:
+            continue
+        if not include_closing and entry.get("is_closing"):
+            continue
+
+        entry_debit = 0
+        entry_credit = 0
+        has_match = False
+        counterparts = set()
+        for line in entry.get("lines") or []:
+            code = line.get("account_code")
+            if code == account_code:
+                entry_debit += line.get("debit") or 0
+                entry_credit += line.get("credit") or 0
+                has_match = True
+            elif code is not None:
+                counterparts.add(code)
+        if not has_match:
+            continue
+
+        if normal_balance == "debit":
+            balance += entry_debit - entry_credit
+        else:
+            balance += entry_credit - entry_debit
+        total_debit += entry_debit
+        total_credit += entry_credit
+
+        rows.append({
+            "entry_id": entry.get("id"),
+            "fiscal_period": fp,
+            "date": entry.get("date"),
+            "description": entry.get("description") or "",
+            "debit": entry_debit,
+            "credit": entry_credit,
+            "balance": balance,
+            "counterparts": ", ".join(sorted(counterparts)),
+        })
+
+    return {
+        "opening_balance": opening_balance,
+        "rows": rows,
+        "closing_balance": balance,
+        "total_debit": total_debit,
+        "total_credit": total_credit,
+    }
+
+
 # 確定申告控除の表示ラベル (tax_summary.js: TAX_CATEGORY_LABELS と同一)。
 TAX_CATEGORY_LABELS = {
     "social_insurance": "社会保険料控除",

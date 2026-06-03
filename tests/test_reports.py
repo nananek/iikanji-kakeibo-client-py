@@ -82,6 +82,59 @@ class TestReportsInterop:
         assert out == GOLDEN["tax_summary"]
 
 
+LEDGER_ENTRIES = [
+    {"id": 1, "fiscal_month": 1, "is_closing": False, "date": "2026-01-15",
+     "description": "消耗品", "lines": [{"account_code": "7010", "debit": 3000, "credit": 0},
+                                       {"account_code": "1010", "debit": 0, "credit": 3000}]},
+    {"id": 2, "fiscal_month": 1, "is_closing": False, "date": "2026-01-20",
+     "description": "売上", "lines": [{"account_code": "1010", "debit": 5000, "credit": 0},
+                                     {"account_code": "4010", "debit": 0, "credit": 5000}]},
+    {"id": 3, "fiscal_month": 2, "is_closing": False, "date": "2026-02-10",
+     "description": "社保", "lines": [{"account_code": "7020", "debit": 2000, "credit": 0},
+                                     {"account_code": "1010", "debit": 0, "credit": 2000}]},
+]
+LEDGER_GOLDEN = json.loads(
+    '{"opening_balance":0,"rows":[{"entry_id":1,"fiscal_period":1,"date":"2026-01-15",'
+    '"description":"消耗品","debit":0,"credit":3000,"balance":-3000,"counterparts":"7010"},'
+    '{"entry_id":2,"fiscal_period":1,"date":"2026-01-20","description":"売上","debit":5000,'
+    '"credit":0,"balance":2000,"counterparts":"4010"},{"entry_id":3,"fiscal_period":2,'
+    '"date":"2026-02-10","description":"社保","debit":0,"credit":2000,"balance":0,'
+    '"counterparts":"7020"}],"closing_balance":0,"total_debit":5000,"total_credit":5000}'
+)
+
+
+class TestLedgerInterop:
+    def test_ledger_matches_js(self) -> None:
+        out = reports.compute_ledger(
+            LEDGER_ENTRIES, account_code="1010", normal_balance="debit")
+        assert out == LEDGER_GOLDEN
+
+    def test_opening_balance_carried(self) -> None:
+        out = reports.compute_ledger(
+            LEDGER_ENTRIES, account_code="1010", normal_balance="debit",
+            opening_balance=100000)
+        assert out["opening_balance"] == 100000
+        assert out["closing_balance"] == 100000  # 元の closing 0 + 100000
+        assert out["rows"][0]["balance"] == 97000  # 100000 - 3000
+
+    def test_credit_normal_balance(self) -> None:
+        out = reports.compute_ledger(
+            LEDGER_ENTRIES, account_code="4010", normal_balance="credit")
+        # 4010 は e2 で credit 5000 のみ → balance = 5000
+        assert out["closing_balance"] == 5000
+        assert out["rows"][0]["counterparts"] == "1010"
+
+    def test_invalid_normal_balance(self) -> None:
+        import pytest
+        with pytest.raises(ValueError):
+            reports.compute_ledger(LEDGER_ENTRIES, account_code="1010", normal_balance="x")
+
+    def test_no_matching_account(self) -> None:
+        out = reports.compute_ledger(
+            LEDGER_ENTRIES, account_code="9999", normal_balance="debit")
+        assert out["rows"] == [] and out["closing_balance"] == 0
+
+
 class TestReportsBehaviour:
     def test_trial_balance_excludes_closing(self) -> None:
         entries = ENTRIES + [

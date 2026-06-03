@@ -368,6 +368,81 @@ class TrialBalance:
     total_credit: int
 
 
+@dataclass
+class ProfitLossRow:
+    """損益計算書の 1 科目行 (収益 or 費用)。"""
+
+    account_code: str
+    account_name: str
+    amount: int  # 収益=credit-debit、費用=debit-credit (いずれも >0)
+
+
+@dataclass
+class ProfitLoss:
+    """損益計算書。"""
+
+    fiscal_year: int
+    income_total: int
+    expense_total: int
+    net_income: int  # income_total - expense_total
+    income_breakdown: list[ProfitLossRow]
+    expense_breakdown: list[ProfitLossRow]
+    month: int | None = None  # 月指定集計なら 1-12、年間なら None
+
+
+@dataclass
+class BalanceSheetRow:
+    """貸借対照表の 1 科目行。"""
+
+    account_code: str
+    account_name: str
+    balance: int
+
+
+@dataclass
+class BalanceSheet:
+    """貸借対照表。"""
+
+    fiscal_year: int
+    assets: list[BalanceSheetRow]
+    liabilities: list[BalanceSheetRow]
+    equities: list[BalanceSheetRow]
+    total_assets: int
+    total_liabilities: int
+    total_equity: int
+    net_income: int  # 損益振替前なら当期純利益、振替後は 0
+    has_closing: bool
+    total_liability_and_equity: int
+
+
+@dataclass
+class LedgerRow:
+    """総勘定元帳の 1 行。"""
+
+    entry_id: int
+    fiscal_period: int
+    date: str | None
+    description: str
+    debit: int
+    credit: int
+    balance: int  # running balance (normal_balance 側を正)
+    counterparts: str  # 相手科目コードのカンマ区切り
+
+
+@dataclass
+class Ledger:
+    """総勘定元帳 (指定科目の時系列明細 + running balance)。"""
+
+    fiscal_year: int
+    account_code: str
+    account_name: str
+    opening_balance: int
+    rows: list[LedgerRow]
+    closing_balance: int
+    total_debit: int
+    total_credit: int
+
+
 # --- 証憑画像 (E2EE, E4 #111 Option C) ---
 
 
