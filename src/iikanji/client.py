@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from . import crypto
+from . import crypto, thumbnail
 from .exceptions import AuthenticationError, KakeiboAPIError, LockedError
 from pathlib import Path
 
@@ -26,6 +26,9 @@ from .models import (
     MedicalExpenseListResponse,
     TrialBalance,
     TrialBalanceRow,
+    VoucherListItem,
+    VoucherListResponse,
+    VoucherUploadResult,
 )
 
 if TYPE_CHECKING:
@@ -825,6 +828,207 @@ class KakeiboClient:
         resp = self._client.delete(f"/api/v1/ai/drafts/{draft_id}")
         if resp.status_code == 200:
             return
+        self._raise_for_error(resp)
+
+    # --- 証憑画像 (E2EE, E4 #111 Option C) ---
+
+    def upload_voucher(
+        self,
+        image: str | Path | bytes,
+        *,
+        journal_entry_id: int | None = None,
+        make_thumbnail: bool = True,
+        original_filename: str | None = None,
+        image_mime: str | None = None,
+    ) -> VoucherUploadResult:
+        """証憑画像を E2EE で 2 段階アップロードする。必要なスコープ: ``journals:create``
+
+        事前に :meth:`unlock` で MK を解錠しておく必要がある。画像/サムネ/メタは
+        クライアントで暗号化され、サーバには暗号文しか渡らない (設計書 §13)。
+
+        フロー (Option A 2 段階 upload):
+          1. ``POST /api/v1/vouchers/init`` で voucher_id + aad_id を採番
+          2. aad_id を AAD に束縛して画像(vimg)/サムネ(vthumb)/メタ(vmeta)を暗号化
+          3. ``PUT /api/v1/vouchers/<id>`` で暗号文の実体を multipart upload
+
+        Args:
+            image: 画像ファイルパス (str/Path) またはバイト列
+            journal_entry_id: 紐付ける仕訳 ID (孤立証憑なら None)
+            make_thumbnail: True なら Pillow で長辺200px JPEG サムネを生成して同梱
+            original_filename: メタに保存する元ファイル名 (パス渡しなら自動)
+            image_mime: メタに保存する MIME (省略時はマジックナンバーから判定)
+
+        Returns:
+            VoucherUploadResult: voucher_id / aad_id / ハッシュ / サムネ有無
+
+        Raises:
+            LockedError: MK が未解錠の場合
+            KakeiboAPIError: init / PUT のエラー (上書き 409 等)
+        """
+        mk, user_id = self._require_mk()
+
+        if isinstance(image, (str, Path)):
+            path = Path(image)
+            image_bytes = path.read_bytes()
+            if original_filename is None:
+                original_filename = path.name
+        else:
+            image_bytes = bytes(image)
+        if not image_bytes:
+            raise ValueError("画像が空です。")
+        if len(image_bytes) > crypto.MAX_IMAGE_BYTES:
+            raise ValueError("画像が 10MB の上限を超えています。")
+        if image_mime is None:
+            image_mime = crypto.sniff_image_mime(image_bytes)
+
+        # 1. init で voucher_id + aad_id を採番 (aad_id は文字列 → int)
+        init_resp = self._client.post(
+            "/api/v1/vouchers/init",
+            json={"journal_entry_id": journal_entry_id},
+        )
+        if init_resp.status_code != 201:
+            self._raise_for_error(init_resp)
+        init_data = init_resp.json()
+        voucher_id = init_data["voucher_id"]
+        aad_id = int(init_data["aad_id"])
+
+        # 2. 暗号化 (vimg/vthumb/vmeta、AAD は aad_id 束縛)
+        image_ct = crypto.encrypt_blob(
+            mk, image_bytes, crypto.build_aad("vimg", user_id, aad_id),
+        )
+        thumb_ct = None
+        if make_thumbnail:
+            thumb_bytes = thumbnail.make_thumbnail(image_bytes)
+            if thumb_bytes:
+                thumb_ct = crypto.encrypt_blob(
+                    mk, thumb_bytes,
+                    crypto.build_aad("vthumb", user_id, aad_id),
+                )
+        meta_record = {
+            "v": 1,
+            "original_filename": original_filename,
+            "image_mime": image_mime,
+        }
+        meta_blob, meta_iv = crypto.encrypt_record(
+            mk, meta_record, crypto.build_aad("vmeta", user_id, aad_id),
+        )
+        file_hash_plain = crypto.sha256_hex(image_bytes)
+
+        # 3. PUT multipart で暗号文を upload
+        files: dict[str, tuple[str, bytes, str]] = {
+            "image_ct": ("image.bin", image_ct, "application/octet-stream"),
+        }
+        if thumb_ct is not None:
+            files["thumb_ct"] = (
+                "thumb.bin", thumb_ct, "application/octet-stream",
+            )
+        data = {
+            "meta_blob": crypto.b64encode(meta_blob),
+            "meta_iv": crypto.b64encode(meta_iv),
+            "file_hash_plain": file_hash_plain,
+        }
+        put_resp = self._client.put(
+            f"/api/v1/vouchers/{voucher_id}", files=files, data=data,
+        )
+        if put_resp.status_code != 200:
+            self._raise_for_error(put_resp)
+        put_data = put_resp.json()
+
+        return VoucherUploadResult(
+            voucher_id=voucher_id,
+            aad_id=aad_id,
+            file_hash_cipher=put_data.get("file_hash_cipher", ""),
+            file_hash_plain=file_hash_plain,
+            has_thumbnail=thumb_ct is not None,
+        )
+
+    def download_voucher_image(
+        self, voucher_id: int, aad_id: int, *, thumb: bool = False,
+    ) -> bytes:
+        """証憑画像 (または サムネ) を fetch して MK で復号し平文バイト列を返す。
+
+        必要なスコープ: ``journals:read``。事前に :meth:`unlock` が必要。
+
+        ``aad_id`` は :meth:`upload_voucher` の戻り値、または :meth:`list_vouchers`
+        の各 :class:`VoucherListItem.aad_id` から得る (AAD 束縛に必須)。
+
+        Args:
+            voucher_id: 証憑 ID (URL/fetch 用)
+            aad_id: AAD 束縛用安定識別子
+            thumb: True ならサムネ (``?size=thumb``, vthumb AAD)。サムネが存在
+                しない証憑に True を渡すとサーバが本体にフォールバックするため
+                復号 (vthumb AAD) に失敗する点に注意。
+
+        Returns:
+            復号した平文画像バイト列。MIME は :func:`crypto.sniff_image_mime`
+            で判定できる。
+
+        Raises:
+            LockedError: MK が未解錠の場合
+            cryptography.exceptions.InvalidTag: AAD/MK 不一致・改ざん時
+        """
+        mk, user_id = self._require_mk()
+        params = {"size": "thumb"} if thumb else None
+        resp = self._client.get(
+            f"/api/v1/vouchers/{voucher_id}/image", params=params,
+        )
+        if resp.status_code != 200:
+            self._raise_for_error(resp)
+        table = "vthumb" if thumb else "vimg"
+        aad = crypto.build_aad(table, user_id, int(aad_id))
+        return crypto.decrypt_blob(mk, resp.content, aad)
+
+    def list_vouchers(
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 20,
+        amount_from: int | None = None,
+        amount_to: int | None = None,
+    ) -> VoucherListResponse:
+        """証憑一覧を取得する。必要なスコープ: ``journals:read``
+
+        MK は不要 (一覧メタのみ)。各件の ``aad_id`` を
+        :meth:`download_voucher_image` に渡して画像を復号する。
+
+        Args:
+            page / per_page: ページネーション (per_page 上限 100)
+            amount_from / amount_to: 紐付く仕訳の借方合計での絞り込み (任意)
+
+        Returns:
+            VoucherListResponse: 証憑一覧とページネーション情報
+        """
+        params: dict[str, int] = {"page": page, "per_page": per_page}
+        if amount_from is not None:
+            params["amount_from"] = amount_from
+        if amount_to is not None:
+            params["amount_to"] = amount_to
+        resp = self._client.get("/api/v1/vouchers", params=params)
+        if resp.status_code == 200:
+            data = resp.json()
+            return VoucherListResponse(
+                vouchers=[
+                    VoucherListItem.from_dict(v) for v in data["vouchers"]
+                ],
+                total=data["total"],
+                page=data["page"],
+                per_page=data["per_page"],
+            )
+        self._raise_for_error(resp)
+
+    def verify_voucher(self, voucher_id: int) -> dict:
+        """サーバ側で暗号文ハッシュ (file_hash_cipher) を再計算して検証する。
+
+        必要なスコープ: ``journals:read``。電帳法の改ざん検知用。サーバは保存済み
+        の暗号文を SHA-256 し、保存ハッシュと一致するかを返す (MK 不要、平文には
+        触れない)。``GET /api/v1/vouchers/<id>/verify``。
+
+        Returns:
+            ``{"ok", "verified", "stored_hash", "computed_hash"}`` 等の生 JSON。
+        """
+        resp = self._client.get(f"/api/v1/vouchers/{voucher_id}/verify")
+        if resp.status_code == 200:
+            return resp.json()
         self._raise_for_error(resp)
 
     # --- 内部ヘルパー ---

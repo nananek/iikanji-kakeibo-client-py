@@ -20,6 +20,7 @@ Python で再現する。E2EE Phase E6 §15.1 トラック3。
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import struct
@@ -179,6 +180,77 @@ def decrypt_record(mk: bytes, blob: bytes, iv: bytes, aad: bytes) -> dict:
         raise ValueError("mk must be 32 bytes")
     plaintext = AESGCM(mk).decrypt(bytes(iv), bytes(blob), aad)
     return json.loads(plaintext.decode("utf-8"))
+
+
+# --- 証憑画像の opaque blob 暗号化 (voucher_upload.js / voucher_download.js) ---
+#
+# 画像/サムネ本体は DB ではなくストレージに格納するため、record (JSON+別送 IV)
+# ではなく ``iv(12B) || ciphertext || GCM tag`` を連結した opaque blob にする
+# (WebCrypto の encrypt は ct||tag を返すため Python の AESGCM.encrypt と同形)。
+# Web の ``voucher_upload.js: _encryptBlob`` (= iv ‖ ciphertext) と byte 互換。
+
+# AES-GCM の最小オーバーヘッド (12B IV + 16B tag)。これ未満の blob は不正。
+GCM_OVERHEAD = 12 + 16
+
+# 平文画像の上限 (サーバ vouchers.MAX_IMAGE_SIZE / voucher_upload.js と一致)。
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def encrypt_blob(mk: bytes, data: bytes, aad: bytes) -> bytes:
+    """生バイト列を MK で暗号化し ``iv(12B) || ciphertext || tag`` を返す。
+
+    IV を blob 先頭に inline で連結する (証憑画像/サムネはストレージ保存のため
+    DB の IV 列を持たない)。Web ``voucher_upload.js`` の ``_encryptBlob`` と互換。
+    """
+    if len(mk) != 32:
+        raise ValueError("mk must be 32 bytes")
+    iv = os.urandom(12)
+    ct = AESGCM(mk).encrypt(iv, bytes(data), aad)
+    return iv + ct
+
+
+def decrypt_blob(mk: bytes, blob: bytes, aad: bytes) -> bytes:
+    """``iv(12B) || ciphertext || tag`` の opaque blob を復号して平文を返す。
+
+    配信エンドポイント (``GET /api/v1/vouchers/<id>/image``) が octet-stream で
+    返す blob をそのまま渡す。AAD 不一致 / 改ざんは ``InvalidTag`` を送出する。
+    """
+    if len(mk) != 32:
+        raise ValueError("mk must be 32 bytes")
+    if len(blob) < GCM_OVERHEAD:
+        raise ValueError("blob too short (iv+tag 未満)")
+    iv = bytes(blob[:12])
+    ct = bytes(blob[12:])
+    return AESGCM(mk).decrypt(iv, ct, aad)
+
+
+def sha256_hex(data: bytes) -> str:
+    """SHA-256 を hex 文字列 (64 桁) で返す (voucher_upload.js: sha256Hex と一致)。"""
+    return hashlib.sha256(bytes(data)).hexdigest()
+
+
+def sniff_image_mime(data: bytes) -> str:
+    """先頭バイト (マジックナンバー) から MIME を判定する。
+
+    Web ``voucher_download.js: sniffImageMime`` と同じ判定。判定不能なら
+    ``application/octet-stream`` を返す (許可は jpeg/png/gif/webp)。
+    """
+    b = bytes(data)
+    if len(b) < 4:
+        return "application/octet-stream"
+    if b[0] == 0xFF and b[1] == 0xD8 and b[2] == 0xFF:
+        return "image/jpeg"
+    if b[0] == 0x89 and b[1] == 0x50 and b[2] == 0x4E and b[3] == 0x47:
+        return "image/png"
+    if b[0] == 0x47 and b[1] == 0x49 and b[2] == 0x46:
+        return "image/gif"
+    if (
+        len(b) >= 12
+        and b[0] == 0x52 and b[1] == 0x49 and b[2] == 0x46 and b[3] == 0x46
+        and b[8] == 0x57 and b[9] == 0x45 and b[10] == 0x42 and b[11] == 0x50
+    ):
+        return "image/webp"
+    return "application/octet-stream"
 
 
 # --- OS keyring への MK 永続化 (§15.1) ---

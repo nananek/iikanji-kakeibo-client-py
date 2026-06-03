@@ -276,3 +276,41 @@ with KakeiboClient("https://example.com", "ik_your_key") as client:
         ],
     )
 ```
+
+## 証憑画像の E2EE アップロードと取得
+
+レシート等の証憑画像をクライアント側で暗号化して保存し、後で復号して取り出します。
+画像・サムネ・メタはサーバーに暗号文のまま保存され、復号には MK（パスフレーズ解錠）が
+必要です。
+
+```python
+from iikanji import KakeiboClient, crypto
+
+with KakeiboClient("https://example.com", "ik_your_key") as client:
+    if not client.is_unlocked:
+        client.unlock("あなたのパスフレーズ")
+
+    # 仕訳に紐付けて証憑をアップロード（サムネは Pillow で自動生成）
+    v = client.upload_voucher("receipt.jpg", journal_entry_id=123)
+    print(v.voucher_id, v.aad_id, v.file_hash_cipher)
+
+    # 本体画像を復号取得
+    data = client.download_voucher_image(v.voucher_id, v.aad_id)
+    ext = crypto.sniff_image_mime(data).split("/")[-1]
+    with open(f"voucher.{ext}", "wb") as f:
+        f.write(data)
+
+    # サムネを復号取得（has_thumbnail が True のときのみ）
+    if v.has_thumbnail:
+        thumb = client.download_voucher_image(v.voucher_id, v.aad_id, thumb=True)
+
+    # 一覧（amount で絞り込み可。aad_id が None の証憑はレガシー平文で復号不可）
+    for item in client.list_vouchers(amount_from=1000).vouchers:
+        print(item.id, item.aad_id, item.amount)
+
+    # 改ざん検知（サーバー側で暗号文ハッシュを再計算、MK 不要）
+    print(client.verify_voucher(v.voucher_id)["verified"])
+```
+
+`aad_id` は画像を再取得・復号する際の AAD 束縛に必須です。`voucher_id` は backup/restore で
+再採番されることがありますが、`aad_id` は保持されるため復号互換が保たれます。

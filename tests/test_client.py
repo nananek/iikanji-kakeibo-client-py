@@ -1,6 +1,8 @@
 """KakeiboClient のユニットテスト (E2EE: MK 解錠 + 暗号 wire)"""
 
+import io
 import json
+import re
 
 import httpx
 import pytest
@@ -1535,3 +1537,268 @@ class TestDeleteDraft:
             client.delete_draft(999)
 
         assert exc_info.value.status_code == 404
+
+
+# ========== 証憑画像 (E2EE, E4 #111 Option C) ==========
+
+VOUCHER_AAD_ID = 123456789012345
+
+
+def _parse_multipart(request: httpx.Request) -> dict[str, bytes]:
+    """multipart/form-data リクエストを {field_name: raw_body_bytes} に分解する。"""
+    ctype = request.headers["content-type"]
+    boundary = ctype.split("boundary=")[1].encode()
+    result: dict[str, bytes] = {}
+    for part in request.content.split(b"--" + boundary):
+        if b"\r\n\r\n" not in part:
+            continue
+        headers_blob, _, body = part.partition(b"\r\n\r\n")
+        body = body.rsplit(b"\r\n", 1)[0]  # 末尾 CRLF を除去
+        m = re.search(rb'name="([^"]+)"', headers_blob)
+        if m:
+            result[m.group(1).decode()] = body
+    return result
+
+
+def _make_png(size: tuple[int, int] = (300, 200)) -> bytes:
+    from PIL import Image
+
+    img = Image.new("RGB", size, (10, 20, 30))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _voucher_upload_client() -> tuple[KakeiboClient, list[httpx.Request]]:
+    """init → PUT の 2 段階フローを返すモッククライアント (リクエスト記録付き)。"""
+    log: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        log.append(request)
+        path = request.url.path
+        if request.method == "POST" and path == "/api/v1/vouchers/init":
+            return httpx.Response(
+                201,
+                json={"ok": True, "voucher_id": 99, "aad_id": str(VOUCHER_AAD_ID)},
+            )
+        if request.method == "PUT" and path == "/api/v1/vouchers/99":
+            return httpx.Response(
+                200,
+                json={"ok": True, "voucher_id": 99, "file_hash_cipher": "cipherhash"},
+            )
+        return httpx.Response(404, json={"error": "not found"})
+
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url=BASE_URL,
+        headers={"Authorization": "Bearer ik_testkey"},
+    )
+    client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+    _set_mk(client)
+    return client, log
+
+
+class TestUploadVoucher:
+    def test_two_phase_upload_round_trip(self) -> None:
+        client, log = _voucher_upload_client()
+        png = _make_png()
+        with client:
+            result = client.upload_voucher(png, journal_entry_id=5)
+
+        assert result.voucher_id == 99
+        assert result.aad_id == VOUCHER_AAD_ID
+        assert result.file_hash_cipher == "cipherhash"
+        assert result.file_hash_plain == crypto.sha256_hex(png)
+        assert result.has_thumbnail is True
+
+        # init の payload に journal_entry_id が載る
+        assert json.loads(log[0].content)["journal_entry_id"] == 5
+
+        parts = _parse_multipart(log[1])
+        assert set(parts) >= {
+            "image_ct", "thumb_ct", "meta_blob", "meta_iv", "file_hash_plain",
+        }
+        assert parts["file_hash_plain"].decode() == crypto.sha256_hex(png)
+
+        # image_ct は vimg AAD で復号すると元画像に戻る
+        vimg_aad = crypto.build_aad("vimg", TEST_USER_ID, VOUCHER_AAD_ID)
+        assert crypto.decrypt_blob(TEST_MK, parts["image_ct"], vimg_aad) == png
+
+        # meta (vmeta record) を復号
+        meta = crypto.decrypt_record(
+            TEST_MK,
+            crypto.b64decode(parts["meta_blob"].decode()),
+            crypto.b64decode(parts["meta_iv"].decode()),
+            crypto.build_aad("vmeta", TEST_USER_ID, VOUCHER_AAD_ID),
+        )
+        assert meta["v"] == 1
+        assert meta["image_mime"] == "image/png"
+
+        # thumb_ct は vthumb AAD で復号すると JPEG になる
+        vthumb_aad = crypto.build_aad("vthumb", TEST_USER_ID, VOUCHER_AAD_ID)
+        thumb = crypto.decrypt_blob(TEST_MK, parts["thumb_ct"], vthumb_aad)
+        assert thumb[:3] == b"\xff\xd8\xff"
+
+    def test_no_thumbnail(self) -> None:
+        client, log = _voucher_upload_client()
+        with client:
+            result = client.upload_voucher(_make_png(), make_thumbnail=False)
+        assert result.has_thumbnail is False
+        assert "thumb_ct" not in _parse_multipart(log[1])
+
+    def test_filename_from_path(self, tmp_path) -> None:
+        client, log = _voucher_upload_client()
+        p = tmp_path / "領収書.png"
+        p.write_bytes(_make_png())
+        with client:
+            client.upload_voucher(str(p))
+        meta = crypto.decrypt_record(
+            TEST_MK,
+            crypto.b64decode(_parse_multipart(log[1])["meta_blob"].decode()),
+            crypto.b64decode(_parse_multipart(log[1])["meta_iv"].decode()),
+            crypto.build_aad("vmeta", TEST_USER_ID, VOUCHER_AAD_ID),
+        )
+        assert meta["original_filename"] == "領収書.png"
+
+    def test_locked_makes_no_http_call(self) -> None:
+        client, log = _voucher_upload_client()
+        client.lock()
+        with client, pytest.raises(LockedError):
+            client.upload_voucher(_make_png())
+        assert log == []
+
+    def test_empty_image_raises(self) -> None:
+        client, _ = _voucher_upload_client()
+        with client, pytest.raises(ValueError):
+            client.upload_voucher(b"")
+
+    def test_oversize_raises(self) -> None:
+        client, _ = _voucher_upload_client()
+        with client, pytest.raises(ValueError):
+            client.upload_voucher(b"\x00" * (crypto.MAX_IMAGE_BYTES + 1))
+
+    def test_init_error_propagates(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": "仕訳が見つかりません。"})
+
+        http_client = httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url=BASE_URL,
+            headers={"Authorization": "Bearer x"},
+        )
+        client = KakeiboClient(BASE_URL, "x", http_client=http_client)
+        _set_mk(client)
+        with client, pytest.raises(KakeiboAPIError) as exc:
+            client.upload_voucher(_make_png(), journal_entry_id=123)
+        assert exc.value.status_code == 404
+
+
+class TestDownloadVoucherImage:
+    def _client(
+        self, content: bytes, *, status: int = 200, capture: list | None = None,
+    ) -> KakeiboClient:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if capture is not None:
+                capture.append(request)
+            if status != 200:
+                return httpx.Response(status, json={"error": "見つかりません。"})
+            return httpx.Response(
+                200, content=content,
+                headers={"content-type": "application/octet-stream"},
+            )
+
+        http_client = httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url=BASE_URL,
+            headers={"Authorization": "Bearer x"},
+        )
+        client = KakeiboClient(BASE_URL, "x", http_client=http_client)
+        _set_mk(client)
+        return client
+
+    def test_round_trip(self) -> None:
+        png = _make_png()
+        aad = crypto.build_aad("vimg", TEST_USER_ID, 555)
+        blob = crypto.encrypt_blob(TEST_MK, png, aad)
+        client = self._client(blob)
+        with client:
+            assert client.download_voucher_image(99, 555) == png
+
+    def test_thumb_uses_size_param_and_vthumb_aad(self) -> None:
+        thumb = b"\xff\xd8\xff\xe0thumbnail-bytes"
+        aad = crypto.build_aad("vthumb", TEST_USER_ID, 777)
+        blob = crypto.encrypt_blob(TEST_MK, thumb, aad)
+        capture: list[httpx.Request] = []
+        client = self._client(blob, capture=capture)
+        with client:
+            assert client.download_voucher_image(42, 777, thumb=True) == thumb
+        assert capture[0].url.params.get("size") == "thumb"
+
+    def test_locked_raises(self) -> None:
+        client = self._client(b"")
+        client.lock()
+        with client, pytest.raises(LockedError):
+            client.download_voucher_image(99, 555)
+
+    def test_not_found(self) -> None:
+        client = self._client(b"", status=404)
+        with client, pytest.raises(KakeiboAPIError) as exc:
+            client.download_voucher_image(99, 555)
+        assert exc.value.status_code == 404
+
+
+class TestListVouchers:
+    def test_success(self) -> None:
+        body = {
+            "ok": True,
+            "vouchers": [
+                {
+                    "id": 1,
+                    "journal_entry_id": 10,
+                    "aad_id": "123456789012345",
+                    "uploaded_at": "2026-06-01T12:00:00",
+                    "journal": {"amount": 3000},
+                },
+                {
+                    "id": 2,
+                    "journal_entry_id": None,
+                    "aad_id": None,
+                    "uploaded_at": None,
+                    "journal": None,
+                },
+            ],
+            "total": 2,
+            "page": 1,
+            "per_page": 20,
+        }
+        client = _make_client(200, body)
+        with client:
+            resp = client.list_vouchers()
+        assert resp.total == 2
+        assert resp.vouchers[0].aad_id == 123456789012345
+        assert resp.vouchers[0].amount == 3000
+        assert resp.vouchers[1].aad_id is None
+        assert resp.vouchers[1].amount is None
+
+    def test_does_not_require_mk(self) -> None:
+        client = _make_client(200, {
+            "ok": True, "vouchers": [], "total": 0, "page": 1, "per_page": 20,
+        }, unlocked=False)
+        with client:
+            assert client.list_vouchers().total == 0
+
+
+class TestVerifyVoucher:
+    def test_success(self) -> None:
+        client = _make_client(200, {
+            "ok": True, "verified": True,
+            "stored_hash": "abc", "computed_hash": "abc",
+        })
+        with client:
+            assert client.verify_voucher(99)["verified"] is True
+
+    def test_not_found(self) -> None:
+        client = _make_client(404, {"error": "証憑が見つかりません。"})
+        with client, pytest.raises(KakeiboAPIError) as exc:
+            client.verify_voucher(99)
+        assert exc.value.status_code == 404
