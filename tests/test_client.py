@@ -1949,3 +1949,276 @@ class TestEncryptedBackupRoundTrip:
         # デフォルト params で復号でき、暗号文 backup が往復する
         restored = json.loads(crypto.decrypt_backup_archive(blob, "disasterpass123"))
         assert restored["user_id"] == TEST_USER_ID
+
+
+# ========== 監査連携 (HPKE 非同期ワークフロー, E5 #112) ==========
+
+from iikanji import hpke as _hpke  # noqa: E402
+
+
+def _stored_keypair() -> tuple[bytes, dict]:
+    """TEST_MK で暗号化済みの鍵ペアを作り (公開鍵, GET /keypair レスポンス) を返す。"""
+    pub, pkcs8 = _hpke.generate_keypair()
+    ct, iv = crypto.encrypt_gcm(TEST_MK, pkcs8, _hpke.private_key_aad(TEST_USER_ID))
+    resp = {
+        "public_key": crypto.b64encode(pub),
+        "encrypted_private_key": crypto.b64encode(ct),
+        "private_key_iv": crypto.b64encode(iv),
+    }
+    return pub, resp
+
+
+def _audit_client(handler, *, unlocked: bool = True) -> KakeiboClient:
+    hc = httpx.Client(transport=httpx.MockTransport(handler), base_url=BASE_URL,
+                      headers={"Authorization": "Bearer x"})
+    client = KakeiboClient(BASE_URL, "x", http_client=hc)
+    if unlocked:
+        _set_mk(client)
+    return client
+
+
+class TestEnsureKeypair:
+    def test_generates_when_absent(self) -> None:
+        put_body = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/api/v1/keypair":
+                return httpx.Response(200, json={"public_key": None,
+                                                 "encrypted_private_key": None,
+                                                 "private_key_iv": None})
+            if request.method == "PUT" and request.url.path == "/api/v1/keypair":
+                put_body.update(json.loads(request.content))
+                return httpx.Response(200, json=put_body)
+            return httpx.Response(404, json={"error": "nf"})
+
+        client = _audit_client(handler)
+        with client:
+            pub = client.ensure_keypair()
+        assert len(pub) == 32
+        # PUT した秘密鍵は TEST_MK で復号でき、scalar が pub と整合する
+        pkcs8 = crypto.decrypt_gcm(
+            TEST_MK, crypto.b64decode(put_body["encrypted_private_key"]),
+            crypto.b64decode(put_body["private_key_iv"]),
+            _hpke.private_key_aad(TEST_USER_ID),
+        )
+        assert len(pkcs8) == 48
+        # pub と scalar で seal/open が成立
+        scalar = _hpke.pkcs8_to_raw_scalar(pkcs8)
+        enc, ct = _hpke.hpke_seal(pub, b"x", b"a")
+        assert _hpke.hpke_open(scalar, enc, ct, b"a") == b"x"
+
+    def test_returns_existing(self) -> None:
+        pub, resp = _stored_keypair()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=resp)
+
+        client = _audit_client(handler)
+        with client:
+            assert client.ensure_keypair() == pub
+
+    def test_locked_raises(self) -> None:
+        client = _audit_client(lambda r: httpx.Response(200, json={}), unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.ensure_keypair()
+
+
+class TestGetPeerPublicKey:
+    def test_success(self) -> None:
+        pub, _ = _stored_keypair()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/api/v1/keypair/7/public"
+            return httpx.Response(200, json={"user_id": 7, "public_key": crypto.b64encode(pub)})
+
+        client = _audit_client(handler)
+        with client:
+            assert client.get_peer_public_key(7) == pub
+
+    def test_not_found(self) -> None:
+        client = _audit_client(lambda r: httpx.Response(404, json={"error": "not found"}))
+        with client, pytest.raises(KakeiboAPIError) as exc:
+            client.get_peer_public_key(99)
+        assert exc.value.status_code == 404
+
+
+class TestAuditPackageRoundTrip:
+    def test_send_and_open(self) -> None:
+        # 自分 (TEST_USER_ID) が auditor として受信・復号する想定で鍵を保管
+        pub, kp_resp = _stored_keypair()
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/api/v1/keypair":
+                return httpx.Response(200, json=kp_resp)
+            if request.method == "POST" and request.url.path == "/api/v1/audit-packages":
+                captured.update(json.loads(request.content))
+                return httpx.Response(201, json={"id": 50, "audit_grant_id": 7,
+                                                 "round_id": 2, **captured})
+            return httpx.Response(404, json={"error": "nf"})
+
+        client = _audit_client(handler)
+        plaintext = b'{"v":1,"level":3}'
+        with client:
+            pkg = client.send_audit_package(
+                audit_grant_id=7, round_id=2, permission_level=3,
+                recipient_public_key=pub, plaintext=plaintext,
+            )
+            assert pkg["id"] == 50
+            # snapshot_hash が正しい
+            assert crypto.b64decode(captured["snapshot_hash"]) == _hpke.snapshot_hash(plaintext)
+            # 受信側として open すると平文に戻る
+            opened = client.open_audit_package({
+                "audit_grant_id": 7, "round_id": 2,
+                "ephemeral_pubkey": captured["ephemeral_pubkey"],
+                "ciphertext": captured["ciphertext"],
+            })
+        assert opened == plaintext
+
+    def test_send_validation_error(self) -> None:
+        pub, _ = _stored_keypair()
+        client = _audit_client(lambda r: httpx.Response(403, json={"error": "audit grant has been revoked"}))
+        with client, pytest.raises(KakeiboAPIError) as exc:
+            client.send_audit_package(audit_grant_id=7, round_id=1, permission_level=3,
+                                      recipient_public_key=pub, plaintext=b"x")
+        assert exc.value.status_code == 403
+
+
+class TestAuditResponseRoundTrip:
+    def test_send_and_open(self) -> None:
+        pub, kp_resp = _stored_keypair()
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/api/v1/keypair":
+                return httpx.Response(200, json=kp_resp)
+            if request.method == "POST" and request.url.path == "/api/v1/audit-responses":
+                captured.update(json.loads(request.content))
+                return httpx.Response(201, json={"id": 9, "audit_package_id": 50, **captured})
+            return httpx.Response(404, json={"error": "nf"})
+
+        client = _audit_client(handler)
+        with client:
+            resp = client.send_audit_response(
+                audit_package_id=50, response_type="revision",
+                recipient_public_key=pub, plaintext=b"fix this",
+            )
+            assert resp["id"] == 9
+            assert captured["response_type"] == "revision"
+            opened = client.open_audit_response({
+                "audit_package_id": 50,
+                "ephemeral_pubkey": captured["ephemeral_pubkey"],
+                "ciphertext": captured["ciphertext"],
+            })
+        assert opened == b"fix this"
+
+
+class TestAuditListAndState:
+    def test_list_packages_and_responses(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/audit-packages":
+                assert request.url.params.get("role") == "auditor"
+                return httpx.Response(200, json={"audit_packages": [{"id": 1}, {"id": 2}]})
+            if request.url.path == "/api/v1/audit-responses":
+                return httpx.Response(200, json={"audit_responses": [{"id": 5}]})
+            return httpx.Response(404, json={"error": "nf"})
+
+        client = _audit_client(handler)
+        with client:
+            assert len(client.list_audit_packages(role="auditor")) == 2
+            assert client.list_audit_responses()[0]["id"] == 5
+
+    def test_accept_acknowledge_delete(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p == "/api/v1/audit-packages/50/accept":
+                return httpx.Response(200, json={"id": 50, "owner_accepted_at": "2026-06-03"})
+            if p == "/api/v1/audit-responses/9/acknowledge":
+                return httpx.Response(200, json={"id": 9, "owner_acknowledged_at": "2026-06-03"})
+            if request.method == "DELETE" and p == "/api/v1/audit-packages/50":
+                return httpx.Response(204)
+            return httpx.Response(404, json={"error": "nf"})
+
+        client = _audit_client(handler)
+        with client:
+            assert client.accept_audit_package(50)["owner_accepted_at"]
+            assert client.acknowledge_audit_response(9)["owner_acknowledged_at"]
+            client.delete_audit_package(50)  # no raise
+
+
+class TestBuildLv3Snapshot:
+    def test_structure(self) -> None:
+        je_b, je_iv = _enc({"v": 1, "date": "2026-02-15", "description": "弁当",
+                            "source": "api", "fiscal_period": None}, "je")
+        backup = {
+            "version": "1.0", "user_id": TEST_USER_ID,
+            "data": {
+                "accounts": [{"code": "7010", "name": "食費"}],
+                "fiscal_closes": [], "journal_entries": [
+                    {"id": 1, "encrypted_blob": je_b, "blob_iv": je_iv}],
+                "journal_entry_lines": [], "medical_expenses": [],
+                "balance_cache_blobs": [], "vouchers": [],
+                "ai_drafts": [], "user_ai_config": None,
+                "tax_form_mappings": [], "csv_column_profiles": [],
+            },
+        }
+        accounts_api = {"ok": True, "accounts": [
+            {"code": "7010", "name": "食費", "account_type": "expense",
+             "account_type_name": "費用", "normal_balance": "debit", "tax_category": "課税"},
+        ]}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/backup/export":
+                return httpx.Response(200, json=backup)
+            if request.url.path == "/api/v1/accounts":
+                return httpx.Response(200, json=accounts_api)
+            return httpx.Response(404, json={"error": "nf"})
+
+        client = _audit_client(handler)
+        with client:
+            snap = client.build_lv3_snapshot()
+        assert snap["v"] == 1 and snap["level"] == 3
+        assert snap["accounts_meta"]["7010"]["normal_balance"] == "debit"
+        assert snap["accounts_meta"]["7010"]["type"] == "expense"
+        assert snap["journal_entries"][0]["description"] == "弁当"
+        assert snap["vouchers"] == []
+
+    def test_send_lv3_snapshot_end_to_end(self) -> None:
+        # 監査者 (peer, user 8) の鍵ペア。秘密鍵は MK 非関与 (相手の鍵)。
+        pub, peer_pkcs8 = _hpke.generate_keypair()
+        je_b, je_iv = _enc({"v": 1, "date": "2026-02-15", "description": "x",
+                            "source": "api", "fiscal_period": None}, "je")
+        backup = {"version": "1.0", "user_id": TEST_USER_ID, "data": {
+            "accounts": [], "fiscal_closes": [], "journal_entries": [
+                {"id": 1, "encrypted_blob": je_b, "blob_iv": je_iv}],
+            "journal_entry_lines": [], "medical_expenses": [], "balance_cache_blobs": [],
+            "vouchers": [], "ai_drafts": [], "user_ai_config": None,
+            "tax_form_mappings": [], "csv_column_profiles": []}}
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p == "/api/v1/backup/export":
+                return httpx.Response(200, json=backup)
+            if p == "/api/v1/accounts":
+                return httpx.Response(200, json={"ok": True, "accounts": []})
+            if p == "/api/v1/keypair/8/public":
+                return httpx.Response(200, json={"user_id": 8, "public_key": crypto.b64encode(pub)})
+            if request.method == "POST" and p == "/api/v1/audit-packages":
+                captured.update(json.loads(request.content))
+                return httpx.Response(201, json={"id": 77, **captured})
+            return httpx.Response(404, json={"error": "nf"})
+
+        client = _audit_client(handler)
+        with client:
+            pkg = client.send_lv3_snapshot(audit_grant_id=7, round_id=1, auditor_user_id=8)
+        assert pkg["id"] == 77
+        assert captured["permission_level"] == 3
+        # 送られた暗号文は recipient (監査者) の秘密鍵で復号でき、Lv3 が入っている
+        snap = json.loads(_hpke.hpke_open(
+            _hpke.pkcs8_to_raw_scalar(peer_pkcs8),
+            crypto.b64decode(captured["ephemeral_pubkey"]),
+            crypto.b64decode(captured["ciphertext"]),
+            _hpke.package_aad(7, 1),
+        ).decode())
+        assert snap["level"] == 3

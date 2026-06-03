@@ -468,6 +468,71 @@ restore_encrypted_backup(path: str | Path, passphrase: str) -> dict
 `save_encrypted_backup` で保存したアーカイブをパスフレーズで復号し、暗号文 backup を
 `restore_backup` に渡します。**戻り値:** 復元件数の dict。
 
+### 監査連携（HPKE 非同期ワークフロー）
+
+owner が MK 復号したスナップショットを監査者の X25519 公開鍵で HPKE 暗号化して送り、
+監査者が秘密鍵で復号して修正案 / 差戻しを暗号化返信する非同期ワークフローです（MK は
+共有しません）。suite = DHKEM-X25519-HKDF-SHA256 / HKDF-SHA256 / AES-256-GCM。Web の
+`@hpke/core` と byte 互換です。下位の暗号関数は `iikanji.hpke` モジュールにあります。
+
+#### `ensure_keypair`
+
+X25519 鍵ペアが未設定なら生成・保管し、自分の公開鍵（raw 32B）を返す。必要なスコープ:
+`journals:read` + `journals:write`（要 MK）。秘密鍵は pkcs8 を MK で AES-GCM 暗号化して
+`PUT /api/v1/keypair` に保管します（サーバーは秘密鍵平文を持ちません）。
+
+```python
+ensure_keypair() -> bytes
+```
+
+#### `get_peer_public_key`
+
+監査相手（owner ⇄ auditor）の X25519 公開鍵（raw 32B）を取得する。必要なスコープ:
+`journals:read`。失効していない AuditGrant で結ばれた相手のみ取得できます。
+
+```python
+get_peer_public_key(user_id: int) -> bytes
+```
+
+#### `send_audit_package` / `open_audit_package`
+
+owner がスナップショット平文を監査者公開鍵宛に HPKE 暗号化して送信 / 受信側が自分の
+秘密鍵で復号。`send` のスコープは `journals:write`、`open` は要 MK。
+
+```python
+send_audit_package(*, audit_grant_id: int, round_id: int, permission_level: int,
+                   recipient_public_key: bytes, plaintext: bytes) -> dict
+open_audit_package(package: dict) -> bytes   # package は list_audit_packages の 1 要素
+list_audit_packages(*, role: str | None = None) -> list[dict]   # role="owner"|"auditor"
+accept_audit_package(package_id: int) -> dict
+delete_audit_package(package_id: int) -> None
+```
+
+#### `send_audit_response` / `open_audit_response`
+
+auditor が修正案（`response_type="revision"`）/ 差戻し（`"rejection"`）を owner 公開鍵宛に
+HPKE 暗号化して返信 / owner が復号。
+
+```python
+send_audit_response(*, audit_package_id: int, response_type: str,
+                    recipient_public_key: bytes, plaintext: bytes) -> dict
+open_audit_response(response: dict) -> bytes
+list_audit_responses() -> list[dict]
+acknowledge_audit_response(response_id: int) -> dict
+```
+
+#### `build_lv3_snapshot` / `send_lv3_snapshot`
+
+Lv3（本人同等）スナップショットを構築 / 構築から送信まで一括。要 MK。全台帳を復号し
+証憑画像を inline base64 で同梱します（設定系は除外）。
+
+```python
+build_lv3_snapshot() -> dict
+send_lv3_snapshot(*, audit_grant_id: int, round_id: int, auditor_user_id: int) -> dict
+```
+
+> Lv1（集計のみ）/ Lv2（税務科目 + 集計）スナップショットの生成は未対応です（後続）。
+
 #### `close`
 
 内部の HTTP クライアントを閉じる。コンテキストマネージャ使用時は自動的に呼ばれる。

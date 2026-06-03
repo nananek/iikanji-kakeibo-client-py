@@ -224,6 +224,27 @@ def decrypt_blob(mk: bytes, blob: bytes, aad: bytes) -> bytes:
     return AESGCM(mk).decrypt(iv, ct, aad)
 
 
+def encrypt_gcm(mk: bytes, data: bytes, aad: bytes) -> tuple[bytes, bytes]:
+    """生バイト列を MK で AES-GCM 暗号化し ``(ciphertext+tag, iv)`` を別々に返す。
+
+    iv と ciphertext を別フィールドで保管する用途 (X25519 秘密鍵の MK ラップ等、
+    Web ``client.encrypt`` の ``{ciphertext, iv}`` と同形)。record/blob と違い
+    JSON 化も iv inline 連結もしない素の GCM。
+    """
+    if len(mk) != 32:
+        raise ValueError("mk must be 32 bytes")
+    iv = os.urandom(12)
+    ct = AESGCM(mk).encrypt(iv, bytes(data), aad)
+    return ct, iv
+
+
+def decrypt_gcm(mk: bytes, ciphertext: bytes, iv: bytes, aad: bytes) -> bytes:
+    """:func:`encrypt_gcm` の逆。``ciphertext+tag`` と ``iv`` を別々に受けて復号する。"""
+    if len(mk) != 32:
+        raise ValueError("mk must be 32 bytes")
+    return AESGCM(mk).decrypt(bytes(iv), bytes(ciphertext), aad)
+
+
 def sha256_hex(data: bytes) -> str:
     """SHA-256 を hex 文字列 (64 桁) で返す (voucher_upload.js: sha256Hex と一致)。"""
     return hashlib.sha256(bytes(data)).hexdigest()

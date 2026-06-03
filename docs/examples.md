@@ -368,3 +368,44 @@ with KakeiboClient("https://example.com", "ik_your_key") as client:
 zip には `journal.csv` / `accounts.csv` / `medical.csv` / `vouchers.csv`（UTF-8 BOM）、
 復号済みの証憑画像（`vouchers/voucher_<id>.<ext>`）、`backup.json`（暗号文・リストア用）、
 `README.txt` が含まれます。復号できなかったレコードは CSV 上 `(復号失敗)` と表示されます。
+
+## 監査連携（HPKE 非同期ワークフロー）
+
+owner が MK 復号したスナップショットを監査者の公開鍵で HPKE 暗号化して送り、監査者が
+秘密鍵で復号して修正案を暗号化返信します。MK は共有しません。
+
+```python
+from iikanji import KakeiboClient
+
+# --- owner 側: Lv3 スナップショットを送信 ---
+with KakeiboClient("https://example.com", "ik_owner_key") as owner:
+    owner.unlock("ownerのパスフレーズ")
+    owner.ensure_keypair()  # 初回のみ鍵ペアを生成・保管
+    pkg = owner.send_lv3_snapshot(audit_grant_id=1, round_id=1, auditor_user_id=8)
+    print("送信:", pkg["id"])
+
+# --- auditor 側: 受信・復号して修正案を返信 ---
+import json
+with KakeiboClient("https://example.com", "ik_auditor_key") as auditor:
+    auditor.unlock("auditorのパスフレーズ")
+    auditor.ensure_keypair()
+    for pkg in auditor.list_audit_packages(role="auditor"):
+        snapshot = json.loads(auditor.open_audit_package(pkg))  # 自分の秘密鍵で復号
+        owner_pub = auditor.get_peer_public_key(pkg["owner_user_id"])
+        auditor.send_audit_response(
+            audit_package_id=pkg["id"], response_type="revision",
+            recipient_public_key=owner_pub, plaintext=b'{"note": "ここを修正してください"}',
+        )
+
+# --- owner 側: 返信を復号して確認 ---
+with KakeiboClient("https://example.com", "ik_owner_key") as owner:
+    owner.unlock("ownerのパスフレーズ")
+    for resp in owner.list_audit_responses():
+        body = owner.open_audit_response(resp)
+        print(resp["response_type"], body)
+        owner.acknowledge_audit_response(resp["id"])
+```
+
+スナップショットの暗号化は suite = DHKEM-X25519-HKDF-SHA256 / HKDF-SHA256 / AES-256-GCM
+（RFC 9180）で、Web の `@hpke/core` と相互運用できます。Lv1 / Lv2（集計スナップショット）は
+未対応です。

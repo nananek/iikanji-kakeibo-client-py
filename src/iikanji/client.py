@@ -10,7 +10,7 @@ import httpx
 import json
 
 from . import backup as backup_mod
-from . import crypto, thumbnail
+from . import crypto, hpke, thumbnail
 from .exceptions import AuthenticationError, KakeiboAPIError, LockedError
 from pathlib import Path
 
@@ -1139,6 +1139,290 @@ class KakeiboClient:
         data = crypto.decrypt_backup_archive(archive, passphrase)
         backup_data = json.loads(data.decode("utf-8"))
         return self.restore_backup(backup_data)
+
+    # --- 監査連携 (HPKE 非同期ワークフロー, E5 #112) ---
+
+    def ensure_keypair(self) -> bytes:
+        """X25519 鍵ペアが未設定なら生成・保管し、自分の公開鍵 (raw 32B) を返す。
+
+        必要なスコープ: ``journals:read`` + ``journals:write``（要 MK 解錠）。秘密鍵は
+        pkcs8 を MK で AES-GCM 暗号化して ``PUT /api/v1/keypair`` に保管します
+        (サーバーは秘密鍵平文も MK も持ちません)。既に鍵ペアがあれば既存公開鍵を返す
+        (回転は非対応)。
+
+        Returns:
+            自分の X25519 公開鍵 (raw 32B)。
+        """
+        mk, user_id = self._require_mk()
+        existing = self._client.get("/api/v1/keypair")
+        if existing.status_code != 200:
+            self._raise_for_error(existing)
+        data = existing.json()
+        if data.get("public_key"):
+            return crypto.b64decode(data["public_key"])
+
+        public_raw, private_pkcs8 = hpke.generate_keypair()
+        ct, iv = crypto.encrypt_gcm(
+            mk, private_pkcs8, hpke.private_key_aad(user_id)
+        )
+        put = self._client.put(
+            "/api/v1/keypair",
+            json={
+                "public_key": crypto.b64encode(public_raw),
+                "encrypted_private_key": crypto.b64encode(ct),
+                "private_key_iv": crypto.b64encode(iv),
+            },
+        )
+        if put.status_code != 200:
+            self._raise_for_error(put)
+        return public_raw
+
+    def _private_scalar(self) -> bytes:
+        """自分の X25519 秘密鍵 raw scalar (32B) を MK 復号して返す。要 MK。"""
+        mk, user_id = self._require_mk()
+        r = self._client.get("/api/v1/keypair")
+        if r.status_code != 200:
+            self._raise_for_error(r)
+        d = r.json()
+        if not d.get("encrypted_private_key") or not d.get("private_key_iv"):
+            raise KakeiboAPIError(
+                404, "鍵ペアが未設定です。先に ensure_keypair() を呼んでください。"
+            )
+        pkcs8 = crypto.decrypt_gcm(
+            mk,
+            crypto.b64decode(d["encrypted_private_key"]),
+            crypto.b64decode(d["private_key_iv"]),
+            hpke.private_key_aad(user_id),
+        )
+        return hpke.pkcs8_to_raw_scalar(pkcs8)
+
+    def get_peer_public_key(self, user_id: int) -> bytes:
+        """監査相手 (owner ⇄ auditor) の X25519 公開鍵 (raw 32B) を取得する。
+
+        必要なスコープ: ``journals:read``。失効していない AuditGrant で結ばれた相手
+        のみ取得できます (それ以外は 404)。``GET /api/v1/keypair/<id>/public``。
+        """
+        r = self._client.get(f"/api/v1/keypair/{user_id}/public")
+        if r.status_code != 200:
+            self._raise_for_error(r)
+        pk = r.json().get("public_key")
+        if not pk:
+            raise KakeiboAPIError(404, "相手の公開鍵が未設定です。")
+        return crypto.b64decode(pk)
+
+    def send_audit_package(
+        self,
+        *,
+        audit_grant_id: int,
+        round_id: int,
+        permission_level: int,
+        recipient_public_key: bytes,
+        plaintext: bytes,
+    ) -> dict:
+        """スナップショット平文を監査者の公開鍵宛に HPKE 暗号化して送信する。
+
+        必要なスコープ: ``journals:write``。AAD は ``audit_grant_id`` /
+        ``round_id`` に束縛されます。``POST /api/v1/audit-packages``。
+
+        Returns:
+            作成された AuditPackage の JSON。
+        """
+        enc, ct = hpke.hpke_seal(
+            recipient_public_key, plaintext,
+            hpke.package_aad(audit_grant_id, round_id),
+        )
+        r = self._client.post(
+            "/api/v1/audit-packages",
+            json={
+                "audit_grant_id": audit_grant_id,
+                "round_id": round_id,
+                "permission_level": permission_level,
+                "ephemeral_pubkey": crypto.b64encode(enc),
+                "ciphertext": crypto.b64encode(ct),
+                "snapshot_hash": crypto.b64encode(hpke.snapshot_hash(plaintext)),
+            },
+        )
+        if r.status_code == 201:
+            return r.json()
+        self._raise_for_error(r)
+
+    def list_audit_packages(self, *, role: str | None = None) -> list[dict]:
+        """自分が関係する AuditPackage 一覧。``role="owner"|"auditor"`` で絞込。"""
+        params = {"role": role} if role else None
+        r = self._client.get("/api/v1/audit-packages", params=params)
+        if r.status_code == 200:
+            return r.json().get("audit_packages", [])
+        self._raise_for_error(r)
+
+    def open_audit_package(self, package: dict) -> bytes:
+        """受信した AuditPackage を自分の秘密鍵で HPKE 復号して平文を返す。要 MK。
+
+        ``package`` は :meth:`list_audit_packages` の 1 要素。AAD は package の
+        ``audit_grant_id`` / ``round_id`` から再構築します。
+        """
+        scalar = self._private_scalar()
+        aad = hpke.package_aad(package["audit_grant_id"], package["round_id"])
+        return hpke.hpke_open(
+            scalar,
+            crypto.b64decode(package["ephemeral_pubkey"]),
+            crypto.b64decode(package["ciphertext"]),
+            aad,
+        )
+
+    def accept_audit_package(self, package_id: int) -> dict:
+        """owner が監査パッケージを採用確定する (``owner_accepted_at`` 記録)。"""
+        r = self._client.post(f"/api/v1/audit-packages/{package_id}/accept")
+        if r.status_code == 200:
+            return r.json()
+        self._raise_for_error(r)
+
+    def delete_audit_package(self, package_id: int) -> None:
+        """AuditPackage を削除する (responses も CASCADE)。"""
+        r = self._client.delete(f"/api/v1/audit-packages/{package_id}")
+        if r.status_code == 204:
+            return
+        self._raise_for_error(r)
+
+    def send_audit_response(
+        self,
+        *,
+        audit_package_id: int,
+        response_type: str,
+        recipient_public_key: bytes,
+        plaintext: bytes,
+    ) -> dict:
+        """auditor が修正案 / 差戻しを owner の公開鍵宛に HPKE 暗号化して返す。
+
+        必要なスコープ: ``journals:write``。``response_type`` は ``"revision"``
+        (修正案) か ``"rejection"`` (差戻し)。AAD は ``audit_package_id`` に束縛。
+        """
+        enc, ct = hpke.hpke_seal(
+            recipient_public_key, plaintext,
+            hpke.response_aad(audit_package_id),
+        )
+        r = self._client.post(
+            "/api/v1/audit-responses",
+            json={
+                "audit_package_id": audit_package_id,
+                "response_type": response_type,
+                "ephemeral_pubkey": crypto.b64encode(enc),
+                "ciphertext": crypto.b64encode(ct),
+            },
+        )
+        if r.status_code == 201:
+            return r.json()
+        self._raise_for_error(r)
+
+    def list_audit_responses(self) -> list[dict]:
+        """自分が関係する AuditResponse 一覧 (package 経由で owner/auditor)。"""
+        r = self._client.get("/api/v1/audit-responses")
+        if r.status_code == 200:
+            return r.json().get("audit_responses", [])
+        self._raise_for_error(r)
+
+    def open_audit_response(self, response: dict) -> bytes:
+        """受信した AuditResponse を自分の秘密鍵で HPKE 復号して平文を返す。要 MK。
+
+        AAD は response の ``audit_package_id`` から再構築します。
+        """
+        scalar = self._private_scalar()
+        aad = hpke.response_aad(response["audit_package_id"])
+        return hpke.hpke_open(
+            scalar,
+            crypto.b64decode(response["ephemeral_pubkey"]),
+            crypto.b64decode(response["ciphertext"]),
+            aad,
+        )
+
+    def acknowledge_audit_response(self, response_id: int) -> dict:
+        """owner が修正案 / 差戻しを確認済みにする (``owner_acknowledged_at``)。"""
+        r = self._client.post(
+            f"/api/v1/audit-responses/{response_id}/acknowledge"
+        )
+        if r.status_code == 200:
+            return r.json()
+        self._raise_for_error(r)
+
+    def build_lv3_snapshot(self) -> dict:
+        """Lv3 (本人同等) 監査スナップショットを構築する。要 MK 解錠。
+
+        必要なスコープ: ``journals:read``。全台帳を復号し、証憑画像を inline
+        base64 で同梱します (Web ``audit_snapshot.js: buildSnapshotLv3`` 相当)。
+        設定系 (AI 設定等) は監査に不要なので含めません。
+
+        Returns:
+            スナップショット dict。:meth:`send_audit_package` の ``plaintext`` に
+            ``json.dumps(...).encode("utf-8")`` で渡せます。
+        """
+        decrypted = self.export_backup_decrypted()
+        d = decrypted.get("data", {})
+        accounts_meta = {
+            a.code: {
+                "type": a.account_type,
+                "normal_balance": a.normal_balance,
+                "name": a.name,
+                "tax_category": a.tax_category,
+            }
+            for a in self.list_accounts()
+        }
+        return {
+            "v": 1,
+            "level": 3,
+            "accounts_meta": accounts_meta,
+            "accounts": d.get("accounts", []),
+            "fiscal_closes": d.get("fiscal_closes", []),
+            "journal_entries": d.get("journal_entries", []),
+            "journal_entry_lines": d.get("journal_entry_lines", []),
+            "medical_expenses": d.get("medical_expenses", []),
+            "balance_cache_blobs": d.get("balance_cache_blobs", []),
+            "vouchers": self._snapshot_vouchers(d.get("vouchers", [])),
+        }
+
+    def _snapshot_vouchers(self, vouchers: list[dict]) -> list[dict]:
+        """Lv3 スナップショット用に証憑画像を復号して inline base64 同梱する。"""
+        out = []
+        for v in vouchers:
+            base = {
+                "voucher_id": v.get("id"),
+                "journal_entry_id": v.get("journal_entry_id"),
+                "aad_id": v.get("aad_id"),
+                "file_hash": v.get("file_hash"),
+                "uploaded_at": v.get("uploaded_at"),
+            }
+            if not v.get("image_data") or not v.get("aad_id"):
+                out.append({**base, "_imageError": True})
+                continue
+            try:
+                plain = self.decrypt_voucher_image_blob(
+                    crypto.b64decode(v["image_data"]), int(v["aad_id"])
+                )
+                out.append({
+                    **base,
+                    "mime": crypto.sniff_image_mime(plain),
+                    "image_base64": crypto.b64encode(plain),
+                })
+            except Exception:
+                out.append({**base, "_imageError": True})
+        return out
+
+    def send_lv3_snapshot(
+        self, *, audit_grant_id: int, round_id: int, auditor_user_id: int
+    ) -> dict:
+        """Lv3 スナップショットを構築し監査者宛に HPKE 暗号化して送信する。要 MK。
+
+        :meth:`build_lv3_snapshot` → :meth:`get_peer_public_key` →
+        :meth:`send_audit_package` (permission_level=3) を一括で行う便利メソッド。
+        """
+        snapshot = self.build_lv3_snapshot()
+        plaintext = json.dumps(snapshot, ensure_ascii=False).encode("utf-8")
+        recipient = self.get_peer_public_key(auditor_user_id)
+        return self.send_audit_package(
+            audit_grant_id=audit_grant_id,
+            round_id=round_id,
+            permission_level=3,
+            recipient_public_key=recipient,
+            plaintext=plaintext,
+        )
 
     # --- 内部ヘルパー ---
 
