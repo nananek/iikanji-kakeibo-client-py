@@ -23,11 +23,45 @@ KakeiboClient(
 | `timeout` | `float` | HTTP タイムアウト秒数（デフォルト: 30.0） |
 | `http_client` | `httpx.Client \| None` | カスタム httpx クライアント（テスト用） |
 
+コンストラクタ実行時、OS キーリングに保存済みの MK があれば自動的に復元されます。
+
+### E2EE マスターキー管理
+
+仕訳の起票・閲覧は MK（マスターキー）の解錠が必要です（未解錠時は `LockedError`）。
+
+#### `unlock`
+
+```python
+unlock(passphrase: str) -> None
+```
+
+`GET /api/v1/wrapped-keys` から passphrase 方式の wrapped_master_key を取得し、
+Argon2id で派生した鍵で MK をアンラップして OS キーリングに保存します。パスフレーズ
+は Web の **設定 → 暗号鍵管理** で登録したものと同じです。
+
+**例外:** wrapped-keys 取得失敗、passphrase 方式未登録、パスフレーズ誤り → `KakeiboAPIError`
+
+#### `lock`
+
+```python
+lock() -> None
+```
+
+MK をメモリと OS キーリングから消去します。
+
+#### `is_unlocked`
+
+```python
+is_unlocked: bool  # プロパティ
+```
+
+MK が解錠済み（暗号化/復号が可能）かどうかを返します。
+
 ### メソッド
 
 #### `create_journal`
 
-仕訳を起票する。必要なスコープ: `journals:create`
+仕訳を起票する。必要なスコープ: `journals:create`（要 MK 解錠）
 
 ```python
 create_journal(
@@ -36,6 +70,7 @@ create_journal(
     description: str,
     lines: list[JournalLine],
     source: str = "api",
+    fiscal_period: int | None = None,
     draft_id: int | None = None,
 ) -> JournalCreateResponse
 ```
@@ -43,10 +78,14 @@ create_journal(
 | 引数 | 型 | 説明 |
 |------|-----|------|
 | `date` | `date \| datetime \| str` | 日付。`date`, `datetime`, または `"YYYY-MM-DD"` 文字列 |
-| `description` | `str` | 摘要（必須、空文字不可） |
-| `lines` | `list[JournalLine]` | 仕訳明細行のリスト（1行以上必須） |
+| `description` | `str` | 摘要 |
+| `lines` | `list[JournalLine]` | 仕訳明細行のリスト |
 | `source` | `str` | ソース種別（デフォルト: `"api"`） |
+| `fiscal_period` | `int \| None` | 0=期首 / 1-12=月 / 13-15=決算整理（省略時は date の月） |
 | `draft_id` | `int \| None` | 確定する下書き ID（省略可）。指定すると下書きの status が done になる |
+
+仕訳本体（date/description/source/fiscal_period）と各明細行の摘要は MK で暗号化されて
+送信されます。
 
 **戻り値:** `JournalCreateResponse`
 
@@ -66,13 +105,12 @@ get_journal(journal_id: int) -> JournalDetail
 
 #### `list_journals`
 
-仕訳一覧を取得する。必要なスコープ: `journals:read`
+仕訳一覧を取得する。必要なスコープ: `journals:read`（要 MK 解錠）
 
 ```python
 list_journals(
     *,
-    date_from: date | datetime | str | None = None,
-    date_to: date | datetime | str | None = None,
+    fiscal_year: int | None = None,
     page: int = 1,
     per_page: int = 20,
 ) -> JournalListResponse
@@ -80,10 +118,12 @@ list_journals(
 
 | 引数 | 型 | 説明 |
 |------|-----|------|
-| `date_from` | `date \| datetime \| str \| None` | 日付の下限（省略可） |
-| `date_to` | `date \| datetime \| str \| None` | 日付の上限（省略可） |
+| `fiscal_year` | `int \| None` | 年度フィルタ（省略可、1900〜2200） |
 | `page` | `int` | ページ番号（デフォルト: 1） |
 | `per_page` | `int` | 1ページあたりの件数（デフォルト: 20, 上限: 100） |
+
+サーバー側の絞り込みは年度単位です（E2EE のため日付は暗号化されており、日付での
+絞り込みは取得後にクライアント側で行います）。取得した各仕訳は MK で復号されます。
 
 **戻り値:** `JournalListResponse`
 

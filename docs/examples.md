@@ -78,12 +78,16 @@ with KakeiboClient("https://example.com", "ik_your_key") as client:
 from iikanji import KakeiboClient
 
 with KakeiboClient("https://example.com", "ik_your_key") as client:
-    # 一覧取得（日付範囲で絞り込み）
-    result = client.list_journals(date_from="2026-02-01", date_to="2026-02-28")
+    if not client.is_unlocked:
+        client.unlock("あなたのパスフレーズ")
+
+    # 一覧取得（年度で絞り込み）。日付での絞り込みは取得後に行う
+    result = client.list_journals(fiscal_year=2026)
     print(f"全{result.total}件中 {len(result.journals)}件取得")
 
     for j in result.journals:
-        print(f"  #{j.entry_number} {j.date} {j.description}")
+        if j.date and "2026-02" <= j.date <= "2026-02-28":
+            print(f"  #{j.entry_number} {j.date} {j.description}")
 
     # 1件取得
     detail = client.get_journal(journal_id=42)

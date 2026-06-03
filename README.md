@@ -3,6 +3,19 @@
 いいかんじ家計簿サーバーの API を Python から呼び出すためのクライアントライブラリです。
 仕訳の起票・閲覧・削除、AI 証憑仕訳（画像解析・下書き管理）に対応しています。
 
+## E2EE（エンドツーエンド暗号化）について
+
+いいかんじ家計簿 v5.0 以降、仕訳データ（日付・摘要・明細）はクライアント側で
+**マスターキー（MK）による AES-256-GCM 暗号化**を行ってから送信されます。サーバー
+は暗号文しか保持しません。そのため、仕訳の起票・閲覧の前に **パスフレーズで MK を
+解錠** する必要があります。
+
+- MK の解錠: `client.unlock("あなたのパスフレーズ")`
+- パスフレーズは Web の **設定 → 暗号鍵管理** で登録したものと同じです
+- 解錠した MK は **OS のキーリング**（macOS Keychain / Windows 資格情報マネージャー /
+  Linux Secret Service）に保存され、次回以降は自動で復元されます
+- `client.lock()` でメモリとキーリングから MK を消去できます
+
 ## インストール
 
 ```bash
@@ -15,6 +28,10 @@ uv add iikanji
 from iikanji import KakeiboClient, JournalLine
 
 with KakeiboClient("https://your-server.example.com", "ik_your_api_key") as client:
+    # 初回のみ: パスフレーズで MK を解錠 (以後は OS キーリングから自動復元)
+    if not client.is_unlocked:
+        client.unlock("あなたのパスフレーズ")
+
     result = client.create_journal(
         date="2026-02-15",
         description="スーパーで食材購入",

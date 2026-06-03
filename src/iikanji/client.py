@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from .exceptions import AuthenticationError, KakeiboAPIError
+from . import crypto
+from .exceptions import AuthenticationError, KakeiboAPIError, LockedError
 from pathlib import Path
 
 from .models import (
@@ -86,6 +87,14 @@ class KakeiboClient:
             )
             self._owns_client = True
 
+        # E2EE: マスターキー (MK) と数値 user_id。仕訳の暗号化/復号に使う。
+        # init 時に OS keyring から復元を試みる (無ければ None = 要 unlock)。
+        self._mk: bytes | None = None
+        self._user_id: int | None = None
+        restored = crypto.load_mk(self._base_url)
+        if restored is not None:
+            self._user_id, self._mk = restored
+
     def __enter__(self) -> KakeiboClient:
         return self
 
@@ -101,6 +110,77 @@ class KakeiboClient:
         if self._owns_client:
             self._client.close()
 
+    # --- E2EE マスターキー (MK) 管理 ---
+
+    @property
+    def is_unlocked(self) -> bool:
+        """MK が解錠済み (仕訳の暗号化/復号が可能) かどうか。"""
+        return self._mk is not None and self._user_id is not None
+
+    def unlock(self, passphrase: str) -> None:
+        """パスフレーズで MK を解錠し、OS keyring に永続化する。
+
+        ``GET /api/v1/wrapped-keys`` で passphrase 方式の wrapped_master_key を
+        取得し、Argon2id で派生した鍵で MK をアンラップする。成功すると以後の
+        仕訳 CRUD が暗号化/復号付きで動作する。
+
+        Args:
+            passphrase: Web で暗号鍵を設定した際のパスフレーズ
+
+        Raises:
+            KakeiboAPIError: wrapped-keys 取得失敗、passphrase 方式が未登録、
+                またはパスフレーズ誤り (アンラップ失敗) の場合
+        """
+        resp = self._client.get("/api/v1/wrapped-keys")
+        if resp.status_code != 200:
+            self._raise_for_error(resp)
+        body = resp.json()
+        user_id = body.get("user_id")
+        if user_id is None:
+            raise KakeiboAPIError(
+                500, "サーバが user_id を返しませんでした (要サーバ更新)。"
+            )
+        rows = body.get("wrapped_keys", [])
+        row = next(
+            (r for r in rows if r.get("method") == "passphrase"), None
+        )
+        if row is None:
+            raise KakeiboAPIError(
+                400,
+                "passphrase 方式の暗号鍵が未登録です。Web の設定 → 暗号鍵管理 "
+                "でパスフレーズを登録してください。",
+            )
+        try:
+            derived = crypto.derive_key(
+                passphrase,
+                crypto.b64decode(row["salt"]),
+                row["kdf_params"],
+            )
+            mk = crypto.unwrap_master_key(
+                crypto.b64decode(row["wrapped_master_key"]),
+                crypto.b64decode(row["wrap_iv"]),
+                derived,
+            )
+        except Exception as exc:
+            raise KakeiboAPIError(
+                400, "パスフレーズが正しくありません (MK のアンラップに失敗)。"
+            ) from exc
+
+        self._mk = mk
+        self._user_id = int(user_id)
+        crypto.store_mk(self._base_url, self._user_id, self._mk)
+
+    def lock(self) -> None:
+        """MK をメモリと OS keyring から消去する。"""
+        self._mk = None
+        self._user_id = None
+        crypto.clear_mk(self._base_url)
+
+    def _require_mk(self) -> tuple[bytes, int]:
+        if self._mk is None or self._user_id is None:
+            raise LockedError()
+        return self._mk, self._user_id
+
     # --- 仕訳起票 ---
 
     def create_journal(
@@ -110,32 +190,41 @@ class KakeiboClient:
         description: str,
         lines: list[JournalLine],
         source: str = "api",
+        fiscal_period: int | None = None,
         draft_id: int | None = None,
     ) -> JournalCreateResponse:
-        """仕訳を起票する。
+        """仕訳を起票する (E2EE: MK で暗号化して送信)。
+
+        事前に :meth:`unlock` で MK を解錠しておく必要がある。
 
         Args:
             date: 日付 (date, datetime, または YYYY-MM-DD 文字列)
             description: 摘要
             lines: 仕訳明細行のリスト
             source: ソース種別 (デフォルト "api")
+            fiscal_period: 0=期首 / 1-12=月 / 13-15=決算整理 (省略時は date の月)
             draft_id: 確定する下書き ID (省略可)。指定すると下書きの status が done になる
 
         Returns:
             JournalCreateResponse: 作成された仕訳の ID と伝票番号
 
         Raises:
+            LockedError: MK が未解錠の場合
             AuthenticationError: APIキーが無効な場合
             KakeiboAPIError: バリデーションエラー等
         """
+        mk, user_id = self._require_mk()
         req = JournalCreateRequest(
             date=date,
             description=description,
             lines=lines,
             source=source,
+            fiscal_period=fiscal_period,
             draft_id=draft_id,
         )
-        resp = self._client.post("/api/v1/journals", json=req.to_dict())
+        resp = self._client.post(
+            "/api/v1/journals", json=req.to_wire(mk, user_id)
+        )
         if resp.status_code == 201:
             data = resp.json()
             return JournalCreateResponse(
@@ -156,43 +245,53 @@ class KakeiboClient:
             JournalDetail: 仕訳の詳細情報
 
         Raises:
+            LockedError: MK が未解錠の場合
             KakeiboAPIError: 仕訳が見つからない場合 (404) 等
         """
+        mk, user_id = self._require_mk()
         resp = self._client.get(f"/api/v1/journals/{journal_id}")
         if resp.status_code == 200:
-            return JournalDetail.from_dict(resp.json()["journal"])
+            return JournalDetail.from_dict(
+                resp.json()["journal"], mk, user_id
+            )
         self._raise_for_error(resp)
 
     def list_journals(
         self,
         *,
-        date_from: date | datetime | str | None = None,
-        date_to: date | datetime | str | None = None,
+        fiscal_year: int | None = None,
         page: int = 1,
         per_page: int = 20,
     ) -> JournalListResponse:
-        """仕訳一覧を取得する。
+        """仕訳一覧を取得する (E2EE: MK で各仕訳を復号して返す)。
+
+        E3-F PR-D-6 以降、サーバの絞り込みは年度 (fiscal_year) 単位。日付での
+        絞り込みは復号後にクライアント側で行う。
 
         Args:
-            date_from: 日付の下限 (省略可)
-            date_to: 日付の上限 (省略可)
+            fiscal_year: 年度フィルタ (省略可、1900〜2200)
             page: ページ番号 (デフォルト 1)
             per_page: 1ページあたりの件数 (デフォルト 20, 上限 100)
 
         Returns:
             JournalListResponse: 仕訳一覧とページネーション情報
+
+        Raises:
+            LockedError: MK が未解錠の場合
         """
+        mk, user_id = self._require_mk()
         params: dict[str, str | int] = {"page": page, "per_page": per_page}
-        if date_from is not None:
-            params["date_from"] = self._to_date_str(date_from)
-        if date_to is not None:
-            params["date_to"] = self._to_date_str(date_to)
+        if fiscal_year is not None:
+            params["fiscal_year"] = fiscal_year
 
         resp = self._client.get("/api/v1/journals", params=params)
         if resp.status_code == 200:
             data = resp.json()
             return JournalListResponse(
-                journals=[JournalDetail.from_dict(j) for j in data["journals"]],
+                journals=[
+                    JournalDetail.from_dict(j, mk, user_id)
+                    for j in data["journals"]
+                ],
                 total=data["total"],
                 page=data["page"],
                 per_page=data["per_page"],
@@ -430,14 +529,6 @@ class KakeiboClient:
         self._raise_for_error(resp)
 
     # --- 内部ヘルパー ---
-
-    @staticmethod
-    def _to_date_str(d: date | datetime | str) -> str:
-        if isinstance(d, str):
-            return d
-        if isinstance(d, datetime):
-            return d.date().isoformat()
-        return d.isoformat()
 
     @staticmethod
     def _raise_for_error(resp: httpx.Response) -> None:

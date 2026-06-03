@@ -26,6 +26,21 @@ API キーはサーバーの **設定 > API キー管理** から発行できま
 | `journals:delete` | 仕訳削除 |
 | `ai:analyze` | AI証憑仕訳（解析・下書き管理） |
 
+## E2EE: マスターキーの解錠
+
+v5.0 以降、仕訳データはクライアント側で暗号化されます。仕訳の起票・閲覧の前に
+パスフレーズで MK（マスターキー）を解錠してください。解錠した MK は OS キーリング
+に保存され、次回以降は `KakeiboClient` 生成時に自動復元されます。
+
+```python
+from iikanji import KakeiboClient
+
+with KakeiboClient("https://your-server.example.com", "ik_your_api_key") as client:
+    if not client.is_unlocked:          # キーリングに無ければ解錠
+        client.unlock("あなたのパスフレーズ")  # Web 設定→暗号鍵管理 と同じパスフレーズ
+    # client.lock()  # 必要なら MK を消去
+```
+
 ## 基本的な使い方
 
 ```python
@@ -33,6 +48,8 @@ from iikanji import KakeiboClient, JournalLine
 
 # コンテキストマネージャで接続を管理
 with KakeiboClient("https://your-server.example.com", "ik_your_api_key") as client:
+    if not client.is_unlocked:
+        client.unlock("あなたのパスフレーズ")
     result = client.create_journal(
         date="2026-02-15",
         description="スーパーで食材購入",
