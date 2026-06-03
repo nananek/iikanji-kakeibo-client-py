@@ -125,6 +125,36 @@ with KakeiboClient("https://example.com", "ik_your_key") as client:
     print(f"{result.total}件 / 自己負担合計 {total}円")
 ```
 
+## 検索・試算表
+
+復号はクライアント側で行うため、検索や集計もローカルで完結します。
+
+```python
+from iikanji import KakeiboClient
+
+with KakeiboClient("https://example.com", "ik_your_key") as client:
+    if not client.is_unlocked:
+        client.unlock("あなたのパスフレーズ")
+
+    # 摘要・科目・日付で検索
+    hits = client.search_journals(fiscal_year=2026, text="食材", account_code="5010")
+    for e in hits:
+        print(f"{e.date} {e.description}")
+
+    # 試算表（決算振替前）
+    tb = client.trial_balance(fiscal_year=2026)
+    for row in tb.rows:
+        print(f"  {row.code} {row.name}（{row.account_type}）残高 {row.balance}")
+    print(f"借方合計 {tb.total_debit} / 貸方合計 {tb.total_credit}")
+
+    # 勘定科目の一覧（科目名・区分の参照に）
+    accounts = client.list_accounts()
+
+    # 確定済み期間の残高キャッシュ（読み込みのみ）
+    cache = client.list_balance_cache_blobs(2026)
+    # cache[period][account_code] == (累計借方, 累計貸方)
+```
+
 ## 仕訳の削除
 
 ```python

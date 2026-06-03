@@ -4,6 +4,7 @@ from . import crypto
 from .client import KakeiboClient
 from .exceptions import AuthenticationError, KakeiboAPIError, LockedError
 from .models import (
+    Account,
     AnalyzeResponse,
     DraftDetail,
     DraftListItem,
@@ -15,6 +16,8 @@ from .models import (
     JournalListResponse,
     MedicalExpense,
     MedicalExpenseListResponse,
+    TrialBalance,
+    TrialBalanceRow,
 )
 
 __all__ = [
@@ -25,6 +28,9 @@ __all__ = [
     "JournalListResponse",
     "MedicalExpense",
     "MedicalExpenseListResponse",
+    "Account",
+    "TrialBalance",
+    "TrialBalanceRow",
     "AnalyzeResponse",
     "DraftDetail",
     "DraftListItem",

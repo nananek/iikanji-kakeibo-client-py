@@ -12,6 +12,7 @@ from .exceptions import AuthenticationError, KakeiboAPIError, LockedError
 from pathlib import Path
 
 from .models import (
+    Account,
     AnalyzeResponse,
     DraftDetail,
     DraftListItem,
@@ -23,6 +24,8 @@ from .models import (
     JournalListResponse,
     MedicalExpense,
     MedicalExpenseListResponse,
+    TrialBalance,
+    TrialBalanceRow,
 )
 
 if TYPE_CHECKING:
@@ -400,6 +403,204 @@ class KakeiboClient:
                 total=data["total"],
             )
         self._raise_for_error(resp)
+
+    # --- 勘定科目 ---
+
+    def list_accounts(self) -> list[Account]:
+        """勘定科目の一覧を取得する。必要なスコープ: ``journals:read``
+
+        科目は E2EE 対象外（平文）のため MK の解錠は不要。
+
+        Returns:
+            list[Account]: display_order / code 順
+        """
+        resp = self._client.get("/api/v1/accounts")
+        if resp.status_code == 200:
+            return [Account.from_dict(a) for a in resp.json()["accounts"]]
+        self._raise_for_error(resp)
+
+    # --- 残高キャッシュ (読み込みのみ) ---
+
+    def list_balance_cache_blobs(
+        self, year: int
+    ) -> dict[int, dict[str, tuple[int, int]]]:
+        """指定年の残高キャッシュ blob を取得・復号する (E2EE)。
+
+        月次確定済み期間の累計残高キャッシュ。生成・更新は owner（Web）の月次
+        確定ワークフローが行うため、client-py は **読み込みのみ**対応する。
+
+        Args:
+            year: 対象年度
+
+        Returns:
+            ``{period: {account_code: (debit, credit)}}``
+            （period = 0=期首 / 1-12=月 / 13-16=決算整理・損益振替）
+
+        Raises:
+            LockedError: MK が未解錠の場合
+        """
+        mk, user_id = self._require_mk()
+        resp = self._client.get(
+            "/api/v1/balance-cache-blobs", params={"year": year}
+        )
+        if resp.status_code != 200:
+            self._raise_for_error(resp)
+        out: dict[int, dict[str, tuple[int, int]]] = {}
+        for b in resp.json()["blobs"]:
+            period = b["period"]
+            try:
+                # bcb record は生マップ {account_code: [debit, credit]}。
+                # AAD = buildAAD("bcb", user_id, year*100 + period)。
+                rec = crypto.decrypt_record(
+                    mk,
+                    crypto.b64decode(b["encrypted_blob"]),
+                    crypto.b64decode(b["blob_iv"]),
+                    crypto.build_aad("bcb", user_id, year * 100 + period),
+                )
+            except Exception:
+                # 1 件の復号失敗で全体を壊さない (空マップにフォールバック)
+                rec = {}
+            out[period] = {
+                code: (int(pair[0]), int(pair[1]))
+                for code, pair in rec.items()
+            }
+        return out
+
+    # --- 検索 / レポート集計 (クライアント側) ---
+
+    def _iter_all_journals(self, fiscal_year: int | None) -> list[JournalDetail]:
+        """指定年度の全仕訳をページングで取得する (復号済み)。"""
+        mk, user_id = self._require_mk()
+        all_entries: list[JournalDetail] = []
+        page = 1
+        per_page = 100
+        while True:
+            params: dict[str, str | int] = {"page": page, "per_page": per_page}
+            if fiscal_year is not None:
+                params["fiscal_year"] = fiscal_year
+            resp = self._client.get("/api/v1/journals", params=params)
+            if resp.status_code != 200:
+                self._raise_for_error(resp)
+            data = resp.json()
+            all_entries.extend(
+                JournalDetail.from_dict(j, mk, user_id) for j in data["journals"]
+            )
+            total = data.get("total", len(all_entries))
+            if not data["journals"] or len(all_entries) >= total:
+                break
+            page += 1
+            if page > 1000:  # 暴走防止
+                break
+        return all_entries
+
+    def search_journals(
+        self,
+        *,
+        fiscal_year: int | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        text: str | None = None,
+        account_code: str | None = None,
+    ) -> list[JournalDetail]:
+        """仕訳を取得し、クライアント側で復号後にフィルタする (E2EE)。
+
+        E2EE のためサーバ側の絞り込みは年度単位のみ。日付・摘要・科目での絞り込みは
+        復号後にここで行う。
+
+        Args:
+            fiscal_year: 年度フィルタ（サーバ側、省略可）
+            date_from / date_to: 日付範囲 (YYYY-MM-DD、両端含む)
+            text: 摘要（仕訳・明細いずれか）に含まれる部分文字列
+            account_code: いずれかの明細がこの科目を含む
+
+        Returns:
+            list[JournalDetail]: 条件に一致した仕訳
+
+        Raises:
+            LockedError: MK が未解錠の場合
+        """
+        entries = self._iter_all_journals(fiscal_year)
+        result: list[JournalDetail] = []
+        for e in entries:
+            if date_from is not None and (e.date is None or e.date < date_from):
+                continue
+            if date_to is not None and (e.date is None or e.date > date_to):
+                continue
+            if account_code is not None and not any(
+                ln.account_code == account_code for ln in e.lines
+            ):
+                continue
+            if text is not None:
+                hay = (e.description or "") + "\n" + "\n".join(
+                    ln.description or "" for ln in e.lines
+                )
+                if text not in hay:
+                    continue
+            result.append(e)
+        return result
+
+    def trial_balance(
+        self, *, fiscal_year: int, include_closing: bool = False
+    ) -> TrialBalance:
+        """試算表（科目単位の借方/貸方合計 + 残高）を集計する (E2EE)。
+
+        仕訳明細の account_code / debit / credit は平文メタなので集計可能。科目名・
+        区分・正常残高は ``GET /api/v1/accounts`` から付与する。残高は各科目の
+        normal_balance に従い、借方科目は ``debit - credit``、貸方科目は
+        ``credit - debit`` を正とする。
+
+        Args:
+            fiscal_year: 対象年度
+            include_closing: True で損益振替（is_closing）仕訳も合算する
+                （既定 False = 決算振替前の試算表）
+
+        Returns:
+            TrialBalance
+
+        Raises:
+            LockedError: MK が未解錠の場合
+        """
+        self._require_mk()  # 仕訳取得前に fail-fast
+        accounts = {a.code: a for a in self.list_accounts()}
+        entries = self._iter_all_journals(fiscal_year)
+
+        debit_by_code: dict[str, int] = {}
+        credit_by_code: dict[str, int] = {}
+        for e in entries:
+            if e.is_closing and not include_closing:
+                continue
+            for ln in e.lines:
+                code = ln.account_code
+                if code is None:
+                    continue
+                debit_by_code[code] = debit_by_code.get(code, 0) + int(ln.debit or 0)
+                credit_by_code[code] = credit_by_code.get(code, 0) + int(ln.credit or 0)
+
+        rows: list[TrialBalanceRow] = []
+        for code in sorted(
+            set(debit_by_code) | set(credit_by_code),
+            key=lambda c: (accounts[c].display_order if c in accounts else 9999, c),
+        ):
+            debit = debit_by_code.get(code, 0)
+            credit = credit_by_code.get(code, 0)
+            acct = accounts.get(code)
+            normal = acct.normal_balance if acct else "debit"
+            balance = (debit - credit) if normal == "debit" else (credit - debit)
+            rows.append(TrialBalanceRow(
+                code=code,
+                name=acct.name if acct else "",
+                account_type=acct.account_type if acct else "",
+                debit=debit,
+                credit=credit,
+                balance=balance,
+            ))
+
+        return TrialBalance(
+            fiscal_year=fiscal_year,
+            rows=rows,
+            total_debit=sum(r.debit for r in rows),
+            total_credit=sum(r.credit for r in rows),
+        )
 
     # --- AI 証憑仕訳 ---
 

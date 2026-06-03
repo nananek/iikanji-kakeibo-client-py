@@ -623,6 +623,178 @@ class TestMedicalExpense:
         assert me.patient_name == "" and me.amount_paid == 0
 
 
+def _acct(code, name, account_type, normal_balance, display_order=0, system_role=None):
+    type_names = {
+        "asset": "資産", "liability": "負債", "equity": "純資産",
+        "revenue": "収益", "expense": "費用",
+    }
+    return {
+        "code": code, "name": name, "account_type": account_type,
+        "account_type_name": type_names.get(account_type, ""),
+        "normal_balance": normal_balance, "is_active": True,
+        "system_role": system_role, "tax_category": None, "cost_type": None,
+        "display_order": display_order,
+    }
+
+
+def _enc_bcb_blob(period: int, balances: dict, year: int = 2026) -> dict:
+    blob, iv = crypto.encrypt_record(
+        TEST_MK, balances,
+        crypto.build_aad("bcb", TEST_USER_ID, year * 100 + period),
+    )
+    return {
+        "year": year, "period": period,
+        "encrypted_blob": crypto.b64encode(blob),
+        "blob_iv": crypto.b64encode(iv),
+        "updated_at": "2026-12-31T00:00:00",
+    }
+
+
+def _router_client(routes: dict) -> KakeiboClient:
+    """パスごとに body を返すモッククライアント (unlocked)。
+
+    routes: {path: body} or {path: callable(request)->body}。journals は
+    ページング非対応の単発レスポンスを想定 (total <= per_page)。
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        body = routes.get(path)
+        if callable(body):
+            body = body(request)
+        if body is None:
+            return httpx.Response(404, json={"error": f"no route: {path}"})
+        return httpx.Response(200, json=body)
+
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url=BASE_URL,
+        headers={"Authorization": "Bearer ik_testkey"},
+    )
+    client = KakeiboClient(BASE_URL, "ik_testkey", http_client=http_client)
+    _set_mk(client)
+    return client
+
+
+class TestReports:
+    def test_list_accounts(self) -> None:
+        body = {"ok": True, "accounts": [
+            _acct("1010", "現金", "asset", "debit", 10),
+            _acct("5010", "食費", "expense", "debit", 80),
+        ]}
+        client = _router_client({"/api/v1/accounts": body})
+        with client:
+            accts = client.list_accounts()
+        assert len(accts) == 2
+        assert accts[0].code == "1010" and accts[0].name == "現金"
+        assert accts[0].account_type == "asset" and accts[0].normal_balance == "debit"
+        assert accts[1].account_type_name == "費用"
+
+    def test_list_accounts_no_mk_required(self) -> None:
+        body = {"ok": True, "accounts": [_acct("1010", "現金", "asset", "debit")]}
+        client = _make_client(200, body, unlocked=False)
+        with client:
+            accts = client.list_accounts()  # MK 不要
+        assert accts[0].code == "1010"
+
+    def test_list_balance_cache_blobs(self) -> None:
+        body = {"blobs": [
+            _enc_bcb_blob(0, {"1010": [10000, 0]}),
+            _enc_bcb_blob(12, {"1010": [50000, 20000], "5010": [12000, 0]}),
+        ]}
+        client = _router_client({"/api/v1/balance-cache-blobs": body})
+        with client:
+            cache = client.list_balance_cache_blobs(2026)
+        assert cache[0]["1010"] == (10000, 0)
+        assert cache[12]["1010"] == (50000, 20000)
+        assert cache[12]["5010"] == (12000, 0)
+
+    def test_balance_cache_requires_unlock(self) -> None:
+        client = _make_client(200, {"blobs": []}, unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.list_balance_cache_blobs(2026)
+
+    def test_search_journals_filters(self) -> None:
+        journals = [
+            _enc_entry_wire(1, date="2026-01-05", description="スーパー食材",
+                            lines=[{"account_code": "5010", "debit": 3000, "description": ""},
+                                   {"account_code": "1010", "credit": 3000, "description": ""}]),
+            _enc_entry_wire(2, date="2026-03-20", description="電気代",
+                            lines=[{"account_code": "5020", "debit": 8000, "description": ""},
+                                   {"account_code": "1010", "credit": 8000, "description": ""}]),
+        ]
+        body = {"ok": True, "journals": journals, "total": 2, "page": 1, "per_page": 100}
+        # date_from で絞り込み
+        client = _router_client({"/api/v1/journals": body})
+        with client:
+            r = client.search_journals(fiscal_year=2026, date_from="2026-02-01")
+        assert [e.id for e in r] == [2]
+        # text で絞り込み
+        client = _router_client({"/api/v1/journals": body})
+        with client:
+            r = client.search_journals(fiscal_year=2026, text="食材")
+        assert [e.id for e in r] == [1]
+        # account_code で絞り込み
+        client = _router_client({"/api/v1/journals": body})
+        with client:
+            r = client.search_journals(fiscal_year=2026, account_code="5020")
+        assert [e.id for e in r] == [2]
+
+    def test_trial_balance_excludes_closing_by_default(self) -> None:
+        accounts_body = {"ok": True, "accounts": [
+            _acct("1010", "現金", "asset", "debit", 10),
+            _acct("4010", "給与収入", "revenue", "credit", 70),
+            _acct("5010", "食費", "expense", "debit", 80),
+        ]}
+        journals = [
+            _enc_entry_wire(1, date="2026-01-05",
+                            lines=[{"account_code": "5010", "debit": 3000, "description": ""},
+                                   {"account_code": "1010", "credit": 3000, "description": ""}]),
+            _enc_entry_wire(2, date="2026-02-25",
+                            lines=[{"account_code": "1010", "debit": 200000, "description": ""},
+                                   {"account_code": "4010", "credit": 200000, "description": ""}]),
+            # closing 仕訳 (除外されるべき)
+            _enc_entry_wire(99, is_closing=True, date="2026-12-31"),
+        ]
+        # closing 仕訳に line を 1 つ付ける (除外確認用)
+        journals[2]["lines"] = [{
+            "id": 1, "account_code": "5010", "debit": 0, "credit": 999,
+            "encrypted_blob": None, "blob_iv": None,
+        }]
+        jbody = {"ok": True, "journals": journals, "total": 3, "page": 1, "per_page": 100}
+        client = _router_client({
+            "/api/v1/accounts": accounts_body,
+            "/api/v1/journals": jbody,
+        })
+        with client:
+            tb = client.trial_balance(fiscal_year=2026)
+        by_code = {r.code: r for r in tb.rows}
+        # closing の 5010 credit 999 は含まれない
+        assert by_code["5010"].debit == 3000 and by_code["5010"].credit == 0
+        assert by_code["5010"].balance == 3000  # 費用=借方正常
+        assert by_code["1010"].debit == 200000 and by_code["1010"].credit == 3000
+        assert by_code["1010"].balance == 197000  # 資産=借方正常
+        assert by_code["4010"].credit == 200000
+        assert by_code["4010"].balance == 200000  # 収益=貸方正常
+        # 貸借合計一致
+        assert tb.total_debit == tb.total_credit == 203000
+
+    def test_trial_balance_include_closing(self) -> None:
+        accounts_body = {"ok": True, "accounts": [_acct("5010", "食費", "expense", "debit", 80)]}
+        j = _enc_entry_wire(99, is_closing=True, date="2026-12-31")
+        j["lines"] = [{"id": 1, "account_code": "5010", "debit": 0, "credit": 999,
+                       "encrypted_blob": None, "blob_iv": None}]
+        jbody = {"ok": True, "journals": [j], "total": 1, "page": 1, "per_page": 100}
+        client = _router_client({"/api/v1/accounts": accounts_body, "/api/v1/journals": jbody})
+        with client:
+            tb = client.trial_balance(fiscal_year=2026, include_closing=True)
+        assert tb.rows[0].credit == 999
+
+    def test_trial_balance_requires_unlock(self) -> None:
+        client = _make_client(200, {"ok": True, "accounts": []}, unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.trial_balance(fiscal_year=2026)
+
+
 def _wrapped_keys_body() -> dict:
     """GET /api/v1/wrapped-keys のモックレスポンス (passphrase 方式)。
 
