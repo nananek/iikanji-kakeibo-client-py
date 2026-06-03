@@ -5,6 +5,7 @@ from . import crypto
 from . import csv_export
 from . import export
 from . import hpke
+from . import reports
 from .client import KakeiboClient
 from .exceptions import AuthenticationError, KakeiboAPIError, LockedError
 from .models import (
@@ -54,4 +55,5 @@ __all__ = [
     "csv_export",
     "export",
     "hpke",
+    "reports",
 ]

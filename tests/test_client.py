@@ -2222,3 +2222,132 @@ class TestBuildLv3Snapshot:
             _hpke.package_aad(7, 1),
         ).decode())
         assert snap["level"] == 3
+
+
+# ========== 監査スナップショット Lv1 / Lv2 ==========
+
+_ACCOUNTS_API = {"ok": True, "accounts": [
+    {"code": "1010", "name": "現金", "account_type": "asset",
+     "account_type_name": "資産", "normal_balance": "debit", "tax_category": None},
+    {"code": "4010", "name": "売上", "account_type": "revenue",
+     "account_type_name": "収益", "normal_balance": "credit", "tax_category": None},
+    {"code": "7010", "name": "消耗品費", "account_type": "expense",
+     "account_type_name": "費用", "normal_balance": "debit", "tax_category": None},
+    {"code": "7020", "name": "社会保険料", "account_type": "expense",
+     "account_type_name": "費用", "normal_balance": "debit", "tax_category": "social_insurance"},
+]}
+
+
+def _journal_api_entry(eid, fiscal_month, lines, *, is_closing=False):
+    je_b, je_iv = _enc({"v": 1, "date": f"2026-{fiscal_month:02d}-15",
+                        "description": "x", "source": "api", "fiscal_period": None}, "je")
+    api_lines = []
+    for code, debit, credit in lines:
+        jl_b, jl_iv = _enc({"v": 1, "account_code": code, "debit_amount": debit,
+                            "credit_amount": credit, "description": ""}, "jel")
+        api_lines.append({"account_code": code, "debit": debit, "credit": credit,
+                          "encrypted_blob": jl_b, "blob_iv": jl_iv})
+    return {"id": eid, "entry_number": eid, "fiscal_year": 2026,
+            "fiscal_month": fiscal_month, "is_closing": is_closing,
+            "encrypted_blob": je_b, "blob_iv": je_iv, "lines": api_lines}
+
+
+_SNAPSHOT_JOURNALS = [
+    _journal_api_entry(1, 1, [("7010", 3000, 0), ("1010", 0, 3000)]),
+    _journal_api_entry(2, 1, [("1010", 5000, 0), ("4010", 0, 5000)]),
+    _journal_api_entry(3, 2, [("7020", 2000, 0), ("1010", 0, 2000)]),
+]
+
+
+def _snapshot_handler(extra=None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p == "/api/v1/accounts":
+            return httpx.Response(200, json=_ACCOUNTS_API)
+        if p == "/api/v1/journals":
+            return httpx.Response(200, json={"journals": _SNAPSHOT_JOURNALS,
+                                             "total": 3, "page": 1, "per_page": 100})
+        if p == "/api/v1/balance-cache-blobs":
+            return httpx.Response(200, json={"blobs": []})  # prior 無し → degraded
+        if extra is not None:
+            r = extra(request)
+            if r is not None:
+                return r
+        return httpx.Response(404, json={"error": "nf"})
+    return handler
+
+
+class TestBuildLv1Snapshot:
+    def test_structure(self) -> None:
+        client = _audit_client(_snapshot_handler())
+        with client:
+            snap = client.build_lv1_snapshot(2026)
+        assert snap["v"] == 1 and snap["level"] == 1 and snap["fiscal_year"] == 2026
+        assert "entries" not in snap  # Lv1 は仕訳本体を含めない
+        assert snap["profit_loss"]["income_total"] == 5000
+        assert snap["profit_loss"]["expense_total"] == 5000
+        assert snap["profit_loss"]["net_income"] == 0
+        assert snap["monthly"]["expense_totals"][0] == 3000
+        assert snap["monthly"]["expense_totals"][1] == 2000
+        tb = {r["account_code"]: r for r in snap["trial_balance"]}
+        assert tb["1010"]["debit"] == 5000 and tb["1010"]["credit"] == 5000
+        # B/S: prior 無しなので当期純利益(0)を純資産側に加算、資産は現金 0 (借方5000-貸方5000)
+        assert snap["balance_sheet"]["has_closing"] is False
+
+    def test_locked_raises(self) -> None:
+        client = _audit_client(_snapshot_handler(), unlocked=False)
+        with client, pytest.raises(LockedError):
+            client.build_lv1_snapshot(2026)
+
+
+class TestBuildLv2Snapshot:
+    def test_tax_summary_and_filtered_entries(self) -> None:
+        client = _audit_client(_snapshot_handler())
+        with client:
+            snap = client.build_lv2_snapshot(2026)
+        assert snap["level"] == 2
+        assert snap["tax_summary"]["social_insurance"]["total"] == 2000
+        # 税務科目 (7020) を含む仕訳のみ → entry id=3 のみ
+        ids = [e["id"] for e in snap["entries"]]
+        assert ids == [3]
+        # entries は明細付き
+        assert snap["entries"][0]["lines"][0]["account_code"] in ("7020", "1010")
+
+
+class TestSendSnapshot:
+    def test_send_lv1_end_to_end(self) -> None:
+        pub, peer_pkcs8 = _hpke.generate_keypair()
+        captured = {}
+
+        def extra(request: httpx.Request) -> httpx.Response | None:
+            p = request.url.path
+            if p == "/api/v1/keypair/8/public":
+                return httpx.Response(200, json={"user_id": 8, "public_key": crypto.b64encode(pub)})
+            if request.method == "POST" and p == "/api/v1/audit-packages":
+                captured.update(json.loads(request.content))
+                return httpx.Response(201, json={"id": 88, **captured})
+            return None
+
+        client = _audit_client(_snapshot_handler(extra))
+        with client:
+            pkg = client.send_snapshot(audit_grant_id=7, round_id=1,
+                                       auditor_user_id=8, level=1, fiscal_year=2026)
+        assert pkg["id"] == 88
+        assert captured["permission_level"] == 1
+        snap = json.loads(_hpke.hpke_open(
+            _hpke.pkcs8_to_raw_scalar(peer_pkcs8),
+            crypto.b64decode(captured["ephemeral_pubkey"]),
+            crypto.b64decode(captured["ciphertext"]),
+            _hpke.package_aad(7, 1),
+        ).decode())
+        assert snap["level"] == 1 and snap["fiscal_year"] == 2026
+
+    def test_lv1_requires_fiscal_year(self) -> None:
+        client = _audit_client(_snapshot_handler())
+        with client, pytest.raises(ValueError):
+            client.send_snapshot(audit_grant_id=7, round_id=1, auditor_user_id=8, level=1)
+
+    def test_invalid_level(self) -> None:
+        client = _audit_client(_snapshot_handler())
+        with client, pytest.raises(ValueError):
+            client.send_snapshot(audit_grant_id=7, round_id=1, auditor_user_id=8, level=5)
