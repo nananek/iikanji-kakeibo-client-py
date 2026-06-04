@@ -1129,26 +1129,25 @@ class KakeiboClient:
         *,
         page: int = 1,
         per_page: int = 20,
-        amount_from: int | None = None,
-        amount_to: int | None = None,
     ) -> VoucherListResponse:
         """証憑一覧を取得する。必要なスコープ: ``journals:read``
 
         MK は不要 (一覧メタのみ)。各件の ``aad_id`` を
         :meth:`download_voucher_image` に渡して画像を復号する。
 
+        #338 item4: サーバが平文金額を SUM する唯一の証憑経路だった
+        ``amount_from`` / ``amount_to`` 絞り込みとレスポンスの借方合計
+        (``VoucherListItem.amount``) は撤去された。金額での絞り込みが必要なら
+        仕訳 API (:meth:`list_journals` / :meth:`search_journals`) を復号して
+        クライアント側で行う。
+
         Args:
             page / per_page: ページネーション (per_page 上限 100)
-            amount_from / amount_to: 紐付く仕訳の借方合計での絞り込み (任意)
 
         Returns:
             VoucherListResponse: 証憑一覧とページネーション情報
         """
         params: dict[str, int] = {"page": page, "per_page": per_page}
-        if amount_from is not None:
-            params["amount_from"] = amount_from
-        if amount_to is not None:
-            params["amount_to"] = amount_to
         resp = self._client.get("/api/v1/vouchers", params=params)
         if resp.status_code == 200:
             data = resp.json()

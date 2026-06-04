@@ -1752,20 +1752,19 @@ class TestListVouchers:
     def test_success(self) -> None:
         body = {
             "ok": True,
+            # #338 item4: 新サーバは journal.amount を返さない (amount は None)。
             "vouchers": [
                 {
                     "id": 1,
                     "journal_entry_id": 10,
                     "aad_id": "123456789012345",
                     "uploaded_at": "2026-06-01T12:00:00",
-                    "journal": {"amount": 3000},
                 },
                 {
                     "id": 2,
                     "journal_entry_id": None,
                     "aad_id": None,
                     "uploaded_at": None,
-                    "journal": None,
                 },
             ],
             "total": 2,
@@ -1777,7 +1776,8 @@ class TestListVouchers:
             resp = client.list_vouchers()
         assert resp.total == 2
         assert resp.vouchers[0].aad_id == 123456789012345
-        assert resp.vouchers[0].amount == 3000
+        assert resp.vouchers[0].journal_entry_id == 10
+        assert resp.vouchers[0].amount is None  # 撤去済 (旧サーバ互換で読むが新は None)
         assert resp.vouchers[1].aad_id is None
         assert resp.vouchers[1].amount is None
 
