@@ -56,11 +56,16 @@ class JournalLine:
     def from_api(cls, line: dict, mk: bytes, user_id: int) -> JournalLine:
         """API レスポンスの line を復号して JournalLine に復元する。
 
-        account_code / debit / credit は平文メタを採用。description は
-        encrypted_blob (jel) を復号して取り出す。復号失敗時は description を
-        空にフォールバック (journals_client.js _normalizeLine と同方針)。
+        #338 item4: サーバは line の平文 account_code / debit / credit を返さなく
+        なった。encrypted_blob (jel) を復号して body から取得する。description も同様。
+        旧サーバ (平文応答) との後方互換のため、復号 body を優先しつつ平文応答へ
+        フォールバックする (journals_client.js _normalizeLine と同方針)。復号失敗
+        (MK 不一致等) かつ平文も無い場合は account_code=None / 金額0。
         """
         description = ""
+        account_code = line.get("account_code")
+        debit = int(line.get("debit", 0) or 0)
+        credit = int(line.get("credit", 0) or 0)
         blob = line.get("encrypted_blob")
         iv = line.get("blob_iv")
         if blob and iv:
@@ -72,12 +77,15 @@ class JournalLine:
                     crypto.build_aad("jel", user_id),
                 )
                 description = body.get("description", "")
+                account_code = body.get("account_code", account_code)
+                debit = int(body.get("debit_amount", debit) or 0)
+                credit = int(body.get("credit_amount", credit) or 0)
             except Exception:
                 description = ""
         return cls(
-            account_code=line.get("account_code"),
-            debit=int(line.get("debit", 0) or 0),
-            credit=int(line.get("credit", 0) or 0),
+            account_code=account_code,
+            debit=debit,
+            credit=credit,
             description=description,
         )
 
