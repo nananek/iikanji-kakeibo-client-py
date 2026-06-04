@@ -38,16 +38,15 @@ class JournalLine:
     def to_wire(self, mk: bytes, user_id: int) -> dict:
         """暗号化 line wire を生成する。
 
-        平文メタは account_code / debit / credit (集計用)。description は
-        encrypted_blob (jel) にのみ格納する。
+        #338 item5 (Phase 5c): line の平文 account_code / debit / credit は wire に
+        乗せない。サーバ (Phase 5b 以降) はこれらを書かず・要求せず・無視するため、
+        本体は encrypted_blob (jel) にのみ格納する (account_code/debit/credit/
+        description は _record_body に収録済)。
         """
         blob, iv = crypto.encrypt_record(
             mk, self._record_body(), crypto.build_aad("jel", user_id)
         )
         return {
-            "account_code": self.account_code,
-            "debit": int(self.debit or 0),
-            "credit": int(self.credit or 0),
             "encrypted_blob": crypto.b64encode(blob),
             "blob_iv": crypto.b64encode(iv),
         }

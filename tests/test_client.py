@@ -196,19 +196,20 @@ class TestCreateJournal:
         assert body["date"] == "2026-01-10"
         assert body["description"] == "食材"
         assert body["source"] == "custom"
-        # line: 平文は account_code/debit/credit のみ、description は暗号化
+        # #338 item5 (Phase 5c): line の平文 account_code/debit/credit は wire に
+        # 乗らない。encrypted_blob/blob_iv のみで、実値は復号 body から取得する。
         assert len(payload["lines"]) == 2
         line0 = payload["lines"][0]
-        assert line0["account_code"] == "7010" and line0["debit"] == 500
-        assert "description" not in line0
+        assert set(line0.keys()) == {"encrypted_blob", "blob_iv"}
         lbody = crypto.decrypt_record(
             TEST_MK,
             crypto.b64decode(line0["encrypted_blob"]),
             crypto.b64decode(line0["blob_iv"]),
             crypto.build_aad("jel", TEST_USER_ID),
         )
-        assert lbody["description"] == "メモ"
+        assert lbody["account_code"] == "7010"
         assert lbody["debit_amount"] == 500
+        assert lbody["description"] == "メモ"
 
     def test_fiscal_period_overrides_month(self) -> None:
         captured: list[dict] = []
