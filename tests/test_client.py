@@ -110,11 +110,10 @@ def _enc_entry_wire(
         lblob, liv = crypto.encrypt_record(
             TEST_MK, line_body, crypto.build_aad("jel", TEST_USER_ID)
         )
+        # #338 item4: サーバは line の平文 account_code/debit/credit を返さない。
+        # id + encrypted_blob + blob_iv のみ (account_code 等は from_api が復号取得)。
         wire["lines"].append({
             "id": ln.get("id", 1),
-            "account_code": ln["account_code"],
-            "debit": int(ln.get("debit", 0)),
-            "credit": int(ln.get("credit", 0)),
             "encrypted_blob": crypto.b64encode(lblob),
             "blob_iv": crypto.b64encode(liv),
         })
