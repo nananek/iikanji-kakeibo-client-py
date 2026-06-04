@@ -478,7 +478,10 @@ class VoucherListItem:
     journal_entry_id: int | None
     aad_id: int | None  # 平文レガシー証憑は None (E2EE 証憑のみ復号可)
     uploaded_at: str | None
-    amount: int | None  # 紐付く仕訳の借方合計 (孤立証憑は None)
+    # #338 item4: 紐付く仕訳の借方合計。サーバが平文金額を SUM する経路だったため
+    # 撤去された (新サーバは journal.amount を返さないので常に None)。旧サーバ互換の
+    # ため from_dict は journal.amount があれば読む (deprecated)。
+    amount: int | None
 
     @classmethod
     def from_dict(cls, d: dict) -> VoucherListItem:
