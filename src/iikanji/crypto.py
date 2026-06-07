@@ -27,7 +27,9 @@ import struct
 import unicodedata
 
 from argon2.low_level import Type, hash_secret_raw
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 # --- base64 ヘルパー ---
 
@@ -83,6 +85,84 @@ def derive_key(passphrase: str, salt: bytes, kdf_params: dict) -> bytes:
         hash_len=32,
         type=Type.ID,
     )
+
+
+# --- ログイン派生 MK: HKDF split (#385, login_kdf.js / bip39.js) ---
+#
+# #385 でパスワード由来鍵は HKDF split する:
+#   master         = Argon2id(login_password, login_salt)        (= derive_key の出力)
+#   login_verifier = HKDF-SHA256(master, info="iikanji-login-v1")   サーバ照合用
+#   mk_wrap_key    = HKDF-SHA256(master, info="iikanji-mk-wrap-v1")  MK の wrap/unwrap 用
+# passphrase 方式の wrapped_master_key は **mk_wrap_key** で wrap されるため、解錠も
+# mk_wrap_key で行う (master を直接使う旧方式ではない)。HKDF は salt=zero(32B), L=32。
+
+# HKDF info (ドメイン分離)。サーバ JS (login_kdf.js / bip39.js) と byte 一致させる。
+LOGIN_VERIFIER_INFO = b"iikanji-login-v1"
+MK_WRAP_KEY_INFO = b"iikanji-mk-wrap-v1"
+SEED_MK_INFO = b"iikanji-master-key-v1"          # リカバリシード → MK unwrap 鍵
+RECOVERY_VERIFIER_INFO = b"iikanji-recovery-login-v1"  # リカバリシード → 検証値 (§3.4.1)
+
+
+def _hkdf32(ikm: bytes, info: bytes) -> bytes:
+    """HKDF-SHA256(ikm, salt=zero(32B), info, L=32) → 32B (login_kdf.js と一致)。"""
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32, salt=b"\x00" * 32, info=info,
+    ).derive(bytes(ikm))
+
+
+def hkdf_login_split(master: bytes) -> tuple[bytes, bytes]:
+    """master (32B) を (login_verifier, mk_wrap_key) に HKDF split する。
+
+    login_kdf.js hkdfLoginSplit と byte 互換。golden vector で凍結。
+    """
+    if not isinstance(master, (bytes, bytearray)) or len(master) != 32:
+        raise ValueError("master must be 32 bytes")
+    return _hkdf32(master, LOGIN_VERIFIER_INFO), _hkdf32(master, MK_WRAP_KEY_INFO)
+
+
+def derive_login_material(
+    password: str, salt: bytes, kdf_params: dict
+) -> dict[str, bytes]:
+    """ログインパスワード + salt + kdf_params から master/login_verifier/mk_wrap_key を派生。
+
+    login_kdf.js deriveLoginMaterial と byte 互換。
+
+    Returns:
+        ``{"master": 32B, "login_verifier": 32B, "mk_wrap_key": 32B}``
+    """
+    master = derive_key(password, salt, kdf_params)  # = Argon2id 出力
+    login_verifier, mk_wrap_key = hkdf_login_split(master)
+    return {
+        "master": master,
+        "login_verifier": login_verifier,
+        "mk_wrap_key": mk_wrap_key,
+    }
+
+
+def normalize_mnemonic(mnemonic: str) -> bytes:
+    """ニーモニックを trim → lowercase → 連続空白畳み → UTF-8 (bip39.js と一致)。"""
+    if not isinstance(mnemonic, str):
+        raise TypeError("mnemonic must be a string")
+    return " ".join(mnemonic.strip().lower().split()).encode("utf-8")
+
+
+def derive_mk_unwrap_key_from_seed(mnemonic: str) -> bytes:
+    """リカバリシード (24 語) → MK unwrap 鍵 (32B)。bip39.js deriveKeyFromMnemonic と一致。"""
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32, salt=b"\x00" * 32, info=SEED_MK_INFO,
+    ).derive(normalize_mnemonic(mnemonic))
+
+
+def derive_recovery_verifier(mnemonic: str) -> bytes:
+    """リカバリシード → サーバ照合用 recovery_verifier (32B)。
+
+    bip39.js deriveRecoveryVerifier と一致 (§3.4.1)。同一シードから MK unwrap 鍵とは
+    別 info で独立導出する。
+    """
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32, salt=b"\x00" * 32,
+        info=RECOVERY_VERIFIER_INFO,
+    ).derive(normalize_mnemonic(mnemonic))
 
 
 # --- MK アンラップ (primitives.js: unwrapMasterKey) ---

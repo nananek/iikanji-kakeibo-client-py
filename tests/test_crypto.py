@@ -334,3 +334,78 @@ class TestKeyring:
 
     def test_clear_missing_is_noop(self) -> None:
         crypto.clear_mk("https://never-stored.example.com")  # should not raise
+
+
+# ============================================================
+# #385 ログイン派生 MK / リカバリシード 派生の byte 互換 golden vector
+# (server tests/static/js/test_login_kdf.mjs / test_recovery_verifier.mjs と一致)
+# ============================================================
+
+# 固定 master = 0x00..0x1f の HKDF split (login_kdf.js golden vector)
+GOLDEN_LOGIN_MASTER = bytes(range(32))
+GOLDEN_LOGIN_VERIFIER_HEX = (
+    "5df62d0f9062c895fbb78a5fa74744c747ee3b2611bbffd3e1c6c44633e69e15"
+)
+GOLDEN_MK_WRAP_KEY_HEX = (
+    "c520a22f75dad5f2c2eccfef9363643241f139280e4cef69ec884238c883e12a"
+)
+# 全ゼロ entropy のニーモニック (BIP-39 公式ベクトル) からの seed 派生
+GOLDEN_ZERO_MNEMONIC = "abandon " * 23 + "art"
+GOLDEN_SEED_MK_HEX = (
+    "616cd7daaa3802aab1372b6a88bb413f601fc76b135387cf7261b7e20fb84a80"
+)
+GOLDEN_RECOVERY_VERIFIER_HEX = (
+    "68a6173b2cc1666e6c19e2dfe7315cd0fd3a2ec33688372adad79aedd478eb0c"
+)
+
+
+class TestLoginDerivedGoldenVectors:
+    def test_hkdf_login_split_matches_js(self) -> None:
+        lv, mw = crypto.hkdf_login_split(GOLDEN_LOGIN_MASTER)
+        assert lv.hex() == GOLDEN_LOGIN_VERIFIER_HEX
+        assert mw.hex() == GOLDEN_MK_WRAP_KEY_HEX
+
+    def test_login_split_domain_separated(self) -> None:
+        lv, mw = crypto.hkdf_login_split(bytes([7] * 32))
+        assert lv != mw
+
+    def test_hkdf_login_split_rejects_bad_length(self) -> None:
+        with pytest.raises(ValueError):
+            crypto.hkdf_login_split(bytes(16))
+
+    def test_derive_login_material_matches_js(self) -> None:
+        """master(=Argon2id) + HKDF split を合成: GOLDEN 入力で固定 master/split。"""
+        material = crypto.derive_login_material(
+            GOLDEN_PASSPHRASE, GOLDEN_SALT, GOLDEN_KDF_PARAMS
+        )
+        assert material["master"].hex() == GOLDEN_DERIVED_HEX
+        # master から HKDF split した値が一致
+        lv, mw = crypto.hkdf_login_split(bytes.fromhex(GOLDEN_DERIVED_HEX))
+        assert material["login_verifier"] == lv
+        assert material["mk_wrap_key"] == mw
+
+    def test_seed_mk_unwrap_key_matches_js(self) -> None:
+        assert (
+            crypto.derive_mk_unwrap_key_from_seed(GOLDEN_ZERO_MNEMONIC).hex()
+            == GOLDEN_SEED_MK_HEX
+        )
+
+    def test_recovery_verifier_matches_js(self) -> None:
+        assert (
+            crypto.derive_recovery_verifier(GOLDEN_ZERO_MNEMONIC).hex()
+            == GOLDEN_RECOVERY_VERIFIER_HEX
+        )
+
+    def test_seed_derivations_domain_separated(self) -> None:
+        """同一シードから MK unwrap 鍵と recovery_verifier は別値 (info 分離)。"""
+        mk = crypto.derive_mk_unwrap_key_from_seed(GOLDEN_ZERO_MNEMONIC)
+        rv = crypto.derive_recovery_verifier(GOLDEN_ZERO_MNEMONIC)
+        assert mk != rv
+
+    def test_mnemonic_normalization(self) -> None:
+        """trim/大小/連続空白の正規化で同一 verifier (bip39.js と一致)。"""
+        messy = "  " + GOLDEN_ZERO_MNEMONIC.upper().replace(" ", "   ") + "  "
+        assert (
+            crypto.derive_recovery_verifier(messy)
+            == crypto.derive_recovery_verifier(GOLDEN_ZERO_MNEMONIC)
+        )
