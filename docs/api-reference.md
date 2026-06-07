@@ -36,8 +36,9 @@ unlock(passphrase: str) -> None
 ```
 
 `GET /api/v1/wrapped-keys` から passphrase 方式の wrapped_master_key を取得し、
-Argon2id で派生した鍵で MK をアンラップして OS キーリングに保存します。パスフレーズ
-は Web の **設定 → 暗号鍵管理** で登録したものと同じです。
+ログインパスワードから派生した鍵 (Argon2id → HKDF split の `mk_wrap_key`、#385) で
+MK をアンラップして OS キーリングに保存します。`passphrase` は Web の **ログイン
+パスワード**と同じです。
 
 **例外:** wrapped-keys 取得失敗、passphrase 方式未登録、パスフレーズ誤り → `KakeiboAPIError`
 

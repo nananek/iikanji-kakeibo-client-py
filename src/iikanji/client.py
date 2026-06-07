@@ -138,8 +138,8 @@ class KakeiboClient:
         """パスフレーズで MK を解錠し、OS keyring に永続化する。
 
         ``GET /api/v1/wrapped-keys`` で passphrase 方式の wrapped_master_key を
-        取得し、Argon2id で派生した鍵で MK をアンラップする。成功すると以後の
-        仕訳 CRUD が暗号化/復号付きで動作する。
+        取得し、ログインパスワードから派生した mk_wrap_key (= HKDF split、#385) で
+        MK をアンラップする。成功すると以後の仕訳 CRUD が暗号化/復号付きで動作する。
 
         Args:
             passphrase: Web で暗号鍵を設定した際のパスフレーズ
@@ -168,7 +168,10 @@ class KakeiboClient:
                 "でパスフレーズを登録してください。",
             )
         try:
-            derived = crypto.derive_key(
+            # #385: passphrase wrapped_key は mk_wrap_key = HKDF(master,
+            # "iikanji-mk-wrap-v1") で wrap されている。master を直接使う旧方式では
+            # 解錠できないため、HKDF split した mk_wrap_key でアンラップする。
+            material = crypto.derive_login_material(
                 passphrase,
                 crypto.b64decode(row["salt"]),
                 row["kdf_params"],
@@ -176,7 +179,7 @@ class KakeiboClient:
             mk = crypto.unwrap_master_key(
                 crypto.b64decode(row["wrapped_master_key"]),
                 crypto.b64decode(row["wrap_iv"]),
-                derived,
+                material["mk_wrap_key"],
             )
         except Exception as exc:
             raise KakeiboAPIError(

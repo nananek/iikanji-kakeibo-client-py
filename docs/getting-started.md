@@ -37,7 +37,7 @@ from iikanji import KakeiboClient
 
 with KakeiboClient("https://your-server.example.com", "ik_your_api_key") as client:
     if not client.is_unlocked:          # キーリングに無ければ解錠
-        client.unlock("あなたのパスフレーズ")  # Web 設定→暗号鍵管理 と同じパスフレーズ
+        client.unlock("あなたのパスフレーズ")  # Web のログインパスワードと同じ
     # client.lock()  # 必要なら MK を消去
 ```
 

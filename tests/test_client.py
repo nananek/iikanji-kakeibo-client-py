@@ -845,22 +845,33 @@ class TestReports:
 def _wrapped_keys_body() -> dict:
     """GET /api/v1/wrapped-keys のモックレスポンス (passphrase 方式)。
 
-    GOLDEN_* と同じ固定入力で MK を導出できる wrapped_master_key を返す。
+    #385: passphrase wrapped_key は mk_wrap_key = HKDF(master, "iikanji-mk-wrap-v1")
+    で wrap される。GOLDEN_* と同じ固定入力から mk_wrap_key を導出し GOLDEN_MK を
+    wrap し直して返す (新 unlock 経路で解錠できる)。
     """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
     from tests.test_crypto import (
         GOLDEN_KDF_PARAMS,
+        GOLDEN_MK_HEX,
+        GOLDEN_PASSPHRASE,
         GOLDEN_SALT,
         GOLDEN_WRAP_IV,
-        GOLDEN_WRAPPED_MK,
     )
 
+    material = crypto.derive_login_material(
+        GOLDEN_PASSPHRASE, GOLDEN_SALT, GOLDEN_KDF_PARAMS
+    )
+    wrapped = AESGCM(material["mk_wrap_key"]).encrypt(
+        GOLDEN_WRAP_IV, bytes.fromhex(GOLDEN_MK_HEX), None
+    )
     return {
         "user_id": 99,
         "wrapped_keys": [
             {
                 "id": 1,
                 "method": "passphrase",
-                "wrapped_master_key": crypto.b64encode(GOLDEN_WRAPPED_MK),
+                "wrapped_master_key": crypto.b64encode(wrapped),
                 "wrap_iv": crypto.b64encode(GOLDEN_WRAP_IV),
                 "salt": crypto.b64encode(GOLDEN_SALT),
                 "kdf_params": GOLDEN_KDF_PARAMS,
